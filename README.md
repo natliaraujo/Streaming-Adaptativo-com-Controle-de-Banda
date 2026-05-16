@@ -1,0 +1,1 @@
+# Streaming-Adaptativo-com-Controle-de-Banda
