@@ -149,7 +149,7 @@ def main():
 
         buffer.drain()  # Drena o buffer antes de iniciar o download
         if throughput_history:
-            avg_vazao = sum(throughput_history[-ABR_HISTORY_SIZE:]) / len(throughput_history)[-ABR_HISTORY_SIZE:])
+            avg_vazao = sum(throughput_history[-ABR_HISTORY_SIZE:]) / len(throughput_history)[-ABR_HISTORY_SIZE:]
 
         else:
             avg_vazao = representations[0]["bitrate_kbps"]  # fallback para o bitrate mais baixo
