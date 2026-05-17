@@ -22,7 +22,7 @@ class BufferManager:
     def __init__(self):
         self.level = 0.0                # segundos de vídeo disponíveis
         self.stall_accumulated = 0.0    # tempo total em rebuffering desde o último reset
-        self.in_stall = False           # indica se estamos atualmente em stall
+        self.in_stall = False           # indica se esta atualmente em stall
         self.last_time = time.time()    # instante da última drenagem
 
     def start_download(self):
