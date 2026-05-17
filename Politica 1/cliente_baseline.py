@@ -133,7 +133,7 @@ def main():
     buffer = BufferManager()
     throughput_history = []
     jitter_ewma = 0.0
-
+    
     # Abre arquivo CSV
     csv_file = open("metricas_baseline.csv", "w", newline="")
     writer = csv.writer(csv_file)
@@ -143,10 +143,16 @@ def main():
         "buffer_level_s", "buffer_can_play", "rebuffer_event", "stall_duration_s",
         "failover_total"
     ])
-
+    
     print(f"Iniciando download de {NUM_SEGMENTS} segmentos...")
+    for seg_num in range(1, NUM_SEGMENTS + 1):
 
+        buffer.drain()  # Drena o buffer antes de iniciar o download
+        if throughput_history:
+            avg_vazao = sum(throughput_history[-ABR_HISTORY_SIZE:]) / len(throughput_history)[-ABR_HISTORY_SIZE:])
 
-
+        else:
+            avg_vazao = representations[0]["bitrate_kbps"]  # fallback para o bitrate mais baixo
+            
 if __name__ == "__main__":
     main()
