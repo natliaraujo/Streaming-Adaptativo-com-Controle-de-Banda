@@ -1,0 +1,1 @@
+segment,timestamp,server_id,quality,bitrate_kbps,vazao_kbps,download_time_s,jitter_network_ms,jitter_ewma_ms,buffer_level_s,buffer_can_play,rebuffer_event,stall_duration_s,failover_total
