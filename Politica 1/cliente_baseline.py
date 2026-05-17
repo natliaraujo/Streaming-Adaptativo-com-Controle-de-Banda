@@ -147,19 +147,13 @@ def main():
     print(f"Iniciando download de {NUM_SEGMENTS} segmentos...")
     for seg_num in range(1, NUM_SEGMENTS + 1):
 
-        buffer.drain()  # Drena o buffer antes de iniciar o download
+        buffer.drain()
         if throughput_history:
-            avg_vazao = sum(throughput_history[-ABR_HISTORY_SIZE:]) / len(throughput_history)[-ABR_HISTORY_SIZE:]
+            avg_vazao = sum(throughput_history[-ABR_HISTORY_SIZE:]) / len(throughput_history[-ABR_HISTORY_SIZE:])
         else:
-            avg_vazao = representations[0]["bitrate_kbps"]  # fallback para o bitrate mais baixo
-        target_bitrate = SAFETY_FACTOR * avg_vazao
-        # Seleciona a melhor representação que seja <= target_bitrate
-        # (Se nenhuma for <=, seleciona a mais baixa)
-        quality = 0
-        for rep in representations:
-            if rep["bitrate_kbps"] <= target_bitrate:
-                quality = rep["quality"]
-            else:
-                break
+            avg_vazao = representations[0]["bitrate_kbps"]   # menor qualidade no início
+
+        safe_bandwidth = avg_vazao * SAFETY_FACTOR
+        
 if __name__ == "__main__":
     main()
