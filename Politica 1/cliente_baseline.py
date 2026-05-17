@@ -20,10 +20,10 @@ ALPHA_EWMA = 0.3             # Fator de suavização para jitter EWMA
 # ------------------------------------------------------------
 class BufferManager:
     def __init__(self):
-        self.level = 0.0                # segundos de vídeo disponíveis
-        self.stall_accumulated = 0.0    # tempo total em rebuffering desde o último reset
-        self.in_stall = False           # indica se esta atualmente em stall
-        self.last_time = time.time()    # instante da última drenagem
+        self.level = 0.0               # segundos de vídeo armazenados
+        self.stall_accumulated = 0.0    # tempo total em rebuffering (acumulado)
+        self.in_stall = False
+        self.last_time = time.time()
 
     def start_download(self):
         """Chamado no início do download de um segmento."""
@@ -126,14 +126,14 @@ def load_manifest(url):
 def main():
     print("Baixando manifesto...")
     segment_duration, servers, representations = load_manifest(MANIFEST_URL)
-    server_url = servers[0]["url"]
+    server_url = servers[0]["url"]   # servidor principal (A)
     server_id = servers[0]["id"]
 
     # Inicializa buffer e métricas
     buffer = BufferManager()
     throughput_history = []
     jitter_ewma = 0.0
-    
+
     # Abre arquivo CSV
     csv_file = open("metricas_baseline.csv", "w", newline="")
     writer = csv.writer(csv_file)
@@ -143,10 +143,12 @@ def main():
         "buffer_level_s", "buffer_can_play", "rebuffer_event", "stall_duration_s",
         "failover_total"
     ])
-    
-    print(f"Iniciando download de {NUM_SEGMENTS} segmentos...")
-    for seg_num in range(1, NUM_SEGMENTS + 1):
 
+    print(f"Iniciando download de {NUM_SEGMENTS} segmentos...")
+
+    for seg_num in range(1, NUM_SEGMENTS + 1):
+        # --- Decisão ABR (Rate‑Based) ---
+        # 1. Drenar tempo ocioso desde o último evento (download ou drain anterior)
         buffer.drain()
         if throughput_history:
             avg_vazao = sum(throughput_history[-ABR_HISTORY_SIZE:]) / len(throughput_history[-ABR_HISTORY_SIZE:])
@@ -154,6 +156,77 @@ def main():
             avg_vazao = representations[0]["bitrate_kbps"]   # menor qualidade no início
 
         safe_bandwidth = avg_vazao * SAFETY_FACTOR
-        
+
+        # Seleciona a maior qualidade cujo bitrate <= safe_bandwidth
+        chosen_rep = None
+        for rep in representations:
+            if rep["bitrate_kbps"] <= safe_bandwidth:
+                chosen_rep = rep
+            else:
+                break
+        if chosen_rep is None:
+            chosen_rep = representations[0]  # fallback
+
+        # --- buffer_can_play (antes do download) ---
+        buffer_can_play = 1 if buffer.level >= segment_duration else 0
+
+        # Timestamp do início (ISO 8601)
+        timestamp = datetime.datetime.utcnow().isoformat()
+
+        # --- Download do segmento ---
+        try:
+            segment_path = f"{chosen_rep['url_path']}?seg={seg_num}"
+            bytes_rec, download_time, vazao, jitter_net = download_segment_v2(
+                buffer, server_url, segment_path, chosen_rep['bitrate_kbps']
+            )
+        except Exception as e:
+            print(f"Erro no segmento {seg_num}: {e}")
+            # Valores de fallback para não quebrar o loop
+            bytes_rec = chosen_rep["segment_bytes"]
+            download_time = 1.0
+            vazao = 0.0             # vazão zero indica falha
+            jitter_net = 0.0
+            # O buffer não foi drenado pela função; a drenagem ociosa no início do
+            # próximo loop cobrirá o tempo real gasto nesta tentativa.
+
+        # --- Atualizar histórico de vazão ---
+        throughput_history.append(vazao)
+        if len(throughput_history) > ABR_HISTORY_SIZE:
+            throughput_history.pop(0)
+
+        # --- Jitter EWMA ---
+        jitter_ewma = ALPHA_EWMA * jitter_net + (1 - ALPHA_EWMA) * jitter_ewma
+
+        # --- Finalizar buffer: adicionar segmento e capturar stall ---
+        buffer.add_segment(segment_duration)
+        stall_duration = buffer.get_stall_and_reset()
+        rebuffer_event = 1 if stall_duration > 0 else 0
+
+        # --- Escrever no CSV ---
+        writer.writerow([
+            seg_num,
+            timestamp,
+            server_id,
+            chosen_rep["quality"],
+            chosen_rep["bitrate_kbps"],
+            round(vazao, 2),
+            round(download_time, 3),
+            round(jitter_net, 2),
+            round(jitter_ewma, 2),
+            round(buffer.level, 2),
+            buffer_can_play,
+            rebuffer_event,
+            round(stall_duration, 3),
+            0    # failover_total (ainda sem failover)
+        ])
+
+        print(f"Seg {seg_num:2d}: {chosen_rep['quality']:5s} "
+              f"Vazão={vazao:6.1f} kbps  Buffer={buffer.level:.2f}s  "
+              f"Rebuffer={rebuffer_event}")
+
+    csv_file.close()
+    print(f"CSV gerado: metricas_baseline.csv")
+    print("Pronto! Agora gere os gráficos com os dados do CSV.")
+
 if __name__ == "__main__":
     main()
