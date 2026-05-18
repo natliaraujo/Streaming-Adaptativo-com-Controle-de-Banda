@@ -5,6 +5,7 @@ import time
 import statistics
 import datetime
 from urllib.parse import urlparse
+from datetime import datetime, timezone, timedelta
 
 # ------------------------------------------------------------
 # 1. Configurações
@@ -210,7 +211,7 @@ def main():
         buffer_can_play = 1 if buffer.level >= segment_duration else 0
 
         # Timestamp do início do download (UTC, seguindo a recomendação de usar timezone-aware)
-        timestamp = datetime.datetime.now(datetime.UTC).isoformat()
+        timestamp = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-3))).isoformat()
 
         # ---- 4. Download do segmento ----
         try:
