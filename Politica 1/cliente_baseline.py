@@ -3,9 +3,9 @@ import json
 import csv
 import time
 import statistics
-import datetime
-from urllib.parse import urlparse
+import os
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse
 
 # ------------------------------------------------------------
 # 1. Configurações
@@ -167,8 +167,10 @@ def main():
     throughput_history = []   # histórico das últimas vazões para a média móvel
     jitter_ewma = 0.0         # EWMA do jitter de rede (alfa = ALPHA_EWMA)
 
-    # Abre arquivo CSV para registro das métricas
-    csv_file = open("metricas_baseline.csv", "w", newline="")
+    # Define o caminho do CSV na mesma pasta do script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    csv_path = os.path.join(script_dir, "metricas_baseline.csv")
+    csv_file = open(csv_path, "w", newline="")
     writer = csv.writer(csv_file)
     writer.writerow([
         "segment", "timestamp", "server_id", "quality", "bitrate_kbps",
@@ -210,8 +212,8 @@ def main():
         # enquanto o próximo segmento é baixado (pelo menos 2s de buffer).
         buffer_can_play = 1 if buffer.level >= segment_duration else 0
 
-        # Timestamp do início do download (UTC, seguindo a recomendação de usar timezone-aware)
-        timestamp = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-3))).isoformat()
+        # Timestamp do início do download (horário de Brasília, UTC-3)
+        timestamp = datetime.now(timezone(timedelta(hours=-3))).isoformat()
 
         # ---- 4. Download do segmento ----
         try:
@@ -266,7 +268,7 @@ def main():
               f"Rebuffer={rebuffer_event}")
 
     csv_file.close()
-    print(f"CSV gerado: metricas_baseline.csv")
+    print(f"CSV gerado: {csv_path}")
 
 if __name__ == "__main__":
     main()
