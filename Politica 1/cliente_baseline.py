@@ -1,3 +1,16 @@
+"""
+Cliente baseline para streaming adaptativo sobre HTTP.
+
+O cliente implementa a primeira política do projeto: um ABR baseado em vazão
+(Rate-Based ABR). A cada segmento, ele estima a banda disponível usando uma
+média móvel das últimas medições, aplica um fator de segurança e escolhe a
+maior representação cujo bitrate nominal cabe nessa banda conservadora.
+
+Além da decisão de qualidade, o módulo simula o buffer de reprodução, mede
+vazão e jitter no nível da aplicação, registra rebuffering e grava as métricas
+em CSV para análise posterior e geração de gráficos.
+"""
+
 import http.client
 import json
 import csv
@@ -5,91 +18,131 @@ import time
 import statistics
 import os
 from datetime import datetime, timezone, timedelta
+from typing import Any
 from urllib.parse import urlparse
 
-# ------------------------------------------------------------
-# 1. Configurações
-# ------------------------------------------------------------
-MANIFEST_URL = "http://137.131.178.229:8080/manifest"
-NUM_SEGMENTS = 10              # Número de segmentos para teste (alterar conforme necessário)
-ABR_HISTORY_SIZE = 5           # Quantas medições de vazão passadas são usadas na média móvel
-SAFETY_FACTOR = 0.8            # Fator de segurança: usa apenas 80% da vazão média estimada
-ALPHA_EWMA = 0.3               # Fator de suavização para o jitter EWMA (0 < alpha <= 1)
+type ServerInfo = dict[str, Any]
+type Representation = dict[str, Any]
 
-# ------------------------------------------------------------
-# 2. Classe BufferManager
-#    Simula o buffer de reprodução do cliente (playout buffer),
-#    como descrito no Capítulo 2 do Kurose (aplicações multimídia).
-#    O buffer é medido em segundos de vídeo e drenado em tempo real,
-#    detectando rebuffering quando o nível fica negativo.
-# ------------------------------------------------------------
+# URL do manifest fornecido pela infraestrutura do projeto.
+MANIFEST_URL: str = "http://137.131.178.229:8080/manifest"
+
+# Parâmetros do experimento baseline.
+NUM_SEGMENTS: int = 10
+ABR_HISTORY_SIZE: int = 5
+SAFETY_FACTOR: float = 0.8
+ALPHA_EWMA: float = 0.3
+
+
 class BufferManager:
-    def __init__(self):
-        self.level = 0.0               # ocupação do buffer (segundos de vídeo)
-        self.stall_accumulated = 0.0   # tempo acumulado em rebuffering desde o último reset
-        self.in_stall = False          # indica se o player está atualmente congelado
-        # Inicializa com o instante atual para que o primeiro drain() não desconte
-        # um intervalo gigante (evita stall artificial na partida).
+    """
+    Simula o buffer de reprodução do cliente.
+
+    O nível do buffer é medido em segundos de vídeo. Durante o download de um
+    segmento, o buffer é drenado pelo tempo real decorrido; quando o download
+    termina, a duração do novo segmento é adicionada. Se o nível chega abaixo
+    de zero, o player entra em rebuffering e o tempo de espera é acumulado.
+
+    Attributes:
+        level: Quantidade de vídeo disponível para reprodução, em segundos.
+        stall_accumulated: Tempo de rebuffering acumulado desde o último reset.
+        in_stall: Indica se o player está atualmente sem dados para reproduzir.
+        last_time: Último instante usado como referência para drenagem.
+    """
+
+    def __init__(self) -> None:
+        self.level: float = 0.0
+        self.stall_accumulated: float = 0.0
+        self.in_stall: bool = False
+        # Evita um stall artificial na partida: a primeira drenagem deve contar
+        # apenas o tempo desde a criação do buffer.
+        self.last_time: float = time.time()
+
+    def start_download(self) -> None:
+        """
+        Reinicia a referência temporal no início de um download.
+
+        Isso separa o tempo gasto transferindo o segmento do tempo ocioso entre
+        eventos, permitindo que `drain()` desconte apenas o intervalo correto.
+        """
         self.last_time = time.time()
 
-    def start_download(self):
+    def drain(self) -> None:
         """
-        Chamado no início do download de um segmento.
-        Reinicia a referência temporal para que a drenagem durante a transferência
-        meça apenas o tempo gasto no download, separadamente do tempo ocioso.
-        """
-        self.last_time = time.time()
+        Drena o buffer pelo tempo real decorrido desde a última medição.
 
-    def drain(self):
+        A reprodução consome um segundo de buffer por segundo real. Quando o
+        nível fica negativo, o valor excedente é registrado como rebuffering e
+        o nível volta para zero, que representa o player parado aguardando dados.
         """
-        Drena o buffer com base no tempo real decorrido desde a última chamada.
-        Representa a exibição contínua do vídeo: cada segundo real consome 1 segundo de buffer.
-        Se o nível se torna negativo, o player entra em rebuffering (stall).
-        """
-        now = time.time()
-        elapsed = now - self.last_time
+        now: float = time.time()
+        elapsed: float = now - self.last_time
         self.level -= elapsed
-        # Detecta início ou continuação de stall
+
         if self.level < 0:
             if not self.in_stall:
                 self.in_stall = True
-            # Acumula o tempo negativo (tempo que o usuário esperou)
             self.stall_accumulated += abs(self.level)
-            self.level = 0.0   # o buffer na prática não fica negativo, estaciona em zero
+            self.level = 0.0
         self.last_time = now
 
-    def add_segment(self, duration):
+    def add_segment(self, duration: float) -> None:
         """
         Adiciona um segmento recém-baixado ao buffer.
-        `duration` é a duração do segmento em segundos (ex.: 2.0 s).
-        Também encerra o estado de stall, pois novos dados chegaram.
+
+        Args:
+            duration: Duração do segmento em segundos.
         """
         self.level += duration
         self.in_stall = False
 
-    def get_stall_and_reset(self):
+    def get_stall_and_reset(self) -> float:
         """
-        Retorna o tempo total de stall acumulado desde o último reset
-        e zera o acumulador para o próximo segmento.
+        Retorna o rebuffering acumulado desde a última consulta.
+
+        Returns:
+            Duração total de stall em segundos, antes de zerar o acumulador.
         """
-        s = self.stall_accumulated
+        s: float = self.stall_accumulated
         self.stall_accumulated = 0.0
         return s
 
-# ------------------------------------------------------------
-# 3. Download de segmento com medição de vazão e jitter
-#    Implementa a métrica de vazão da camada de aplicação (throughput)
-#    e o jitter como o desvio padrão dos intervalos entre chegadas de chunks,
-#    conforme discutido no Kurose (Capítulo 2, Seção 2.6).
-# ------------------------------------------------------------
-def download_segment_v2(buffer, server_url, path, nominal_bitrate):
+
+def download_segment_v2(
+    buffer: BufferManager,
+    server_url: str,
+    path: str,
+    nominal_bitrate: int,
+) -> tuple[int, float, float, float]:
     """
-    Baixa um segmento via HTTP, drena o buffer durante a transferência
-    e retorna: bytes_recebidos, download_time (s), vazao_kbps, jitter_network_ms
+    Baixa um segmento e mede as métricas de rede observadas pelo cliente.
+
+    A função lê a resposta HTTP em chunks de 1024 bytes. A cada chunk recebido,
+    o buffer é drenado pelo tempo real decorrido e o intervalo entre chunks é
+    armazenado para estimar o jitter. A vazão é calculada no nível da aplicação,
+    usando os bytes recebidos e o tempo total do download.
+
+    Args:
+        buffer: Gerenciador do buffer de reprodução.
+        server_url: URL base do servidor escolhido.
+        path: Caminho do segmento no servidor, incluindo query string.
+        nominal_bitrate: Bitrate da representação escolhida, usado apenas como
+            fallback se o tempo medido for zero.
+
+    Returns:
+        Tupla com bytes recebidos, tempo de download em segundos, vazão em kbps
+        e jitter em milissegundos.
+
+    Raises:
+        ValueError: Se a URL do servidor não tiver host.
+        Exception: Se o servidor responder com status HTTP diferente de 200.
     """
     url_parts = urlparse(server_url)
-    host = url_parts.hostname
-    port = url_parts.port
+    host: str | None = url_parts.hostname
+    port: int | None = url_parts.port
+
+    if host is None:
+        raise ValueError(f"URL de servidor inválida: {server_url}")
 
     conn = http.client.HTTPConnection(host, port, timeout=10)
     conn.request("GET", path)
@@ -97,79 +150,93 @@ def download_segment_v2(buffer, server_url, path, nominal_bitrate):
     if response.status != 200:
         raise Exception(f"HTTP error {response.status}")
 
-    data = b""
-    chunk_intervals = []       # intervalos entre chegadas de chunks consecutivos (para jitter)
+    data: bytes = b""
+    chunk_intervals: list[float] = []
 
-    buffer.start_download()    # sincroniza o relógio do buffer para esta transferência
-    start_download = time.time()
-    last_chunk_time = start_download
+    buffer.start_download()
+    start_download: float = time.time()
+    last_chunk_time: float = start_download
 
     while True:
-        chunk = response.read(1024)   # lê até 1024 bytes por vez
+        chunk: bytes = response.read(1024)
         if not chunk:
             break
-        now = time.time()
-        # Drena o buffer com o tempo real gasto para este chunk
+        now: float = time.time()
+
         buffer.drain()
-        # Calcula o intervalo desde o último chunk (para medição de jitter)
         chunk_intervals.append(now - last_chunk_time)
         last_chunk_time = now
         data += chunk
 
-    download_time = time.time() - start_download
-    bytes_received = len(data)
+    download_time: float = time.time() - start_download
+    bytes_received: int = len(data)
 
     # Cálculo da vazão em kbps (proteção contra divisão por zero)
     if download_time > 0:
-        vazao_kbps = (bytes_received * 8) / (download_time * 1000)
+        vazao_kbps: float = (bytes_received * 8) / (download_time * 1000)
     else:
-        vazao_kbps = nominal_bitrate  # fallback (caso extremamente raro)
+        vazao_kbps = nominal_bitrate
 
-    # Jitter de rede: desvio padrão dos intervalos entre chunks (em ms)
     if len(chunk_intervals) > 1:
-        jitter_net = statistics.stdev(chunk_intervals) * 1000
+        jitter_net: float = statistics.stdev(chunk_intervals) * 1000
     else:
         jitter_net = 0.0
 
     conn.close()
     return bytes_received, download_time, vazao_kbps, jitter_net
 
-# ------------------------------------------------------------
-# 4. Baixar e interpretar o manifesto
-#    O manifesto é o arquivo de descrição do conteúdo (como um MPD do DASH).
-# ------------------------------------------------------------
-def load_manifest(url):
+
+def load_manifest(url: str) -> tuple[float, list[ServerInfo], list[Representation]]:
+    """
+    Baixa e interpreta o manifest JSON do conteúdo.
+
+    O manifest informa a duração dos segmentos, a lista de servidores
+    disponíveis e as representações de qualidade. As representações são
+    ordenadas por bitrate para simplificar a decisão ABR.
+
+    Args:
+        url: URL completa do endpoint `/manifest`.
+
+    Returns:
+        Duração do segmento, lista de servidores e lista de representações.
+    """
     import urllib.request
     with urllib.request.urlopen(url) as resp:
-        manifest = json.loads(resp.read().decode('utf-8'))
-    segment_duration = manifest["segment_duration_s"]
-    servers = manifest["servers"]
-    representations = manifest["representations"]
-    # Ordena as qualidades por bitrate (menor para maior) para facilitar a escolha ABR
+        manifest: dict[str, Any] = json.loads(resp.read().decode('utf-8'))
+    segment_duration: float = manifest["segment_duration_s"]
+    servers: list[ServerInfo] = manifest["servers"]
+    representations: list[Representation] = manifest["representations"]
+
     representations.sort(key=lambda r: r["bitrate_kbps"])
     return segment_duration, servers, representations
 
-# ------------------------------------------------------------
-# 5. Loop principal (Baseline Rate‑Based)
-#    Implementa o algoritmo ABR mais simples: escolhe a maior qualidade
-#    cujo bitrate seja menor ou igual a uma estimativa conservadora da banda.
-#    Esse algoritmo é suscetível a oscilações e rebufferings, conforme será
-#    analisado nas próximas tarefas.
-# ------------------------------------------------------------
-def main():
+
+def main() -> None:
+    """
+    Executa a política baseline Rate-Based ABR.
+
+    Para cada segmento, o fluxo é:
+    1. drenar o buffer pelo tempo decorrido;
+    2. estimar a vazão pela média móvel das últimas medições;
+    3. aplicar o fator de segurança;
+    4. escolher a maior qualidade que cabe na banda segura;
+    5. baixar o segmento e medir vazão/jitter;
+    6. atualizar buffer, EWMA de jitter e CSV de métricas.
+
+    O CSV gerado é a base para gráficos, comparação com políticas futuras e
+    correlação com capturas no Wireshark.
+    """
     print("Baixando manifesto...")
     segment_duration, servers, representations = load_manifest(MANIFEST_URL)
-    server_url = servers[0]["url"]   # servidor principal (A)
-    server_id = servers[0]["id"]
+    server_url: str = servers[0]["url"]
+    server_id: str = servers[0]["id"]
 
-    # Inicializa buffer e métricas
-    buffer = BufferManager()
-    throughput_history = []   # histórico das últimas vazões para a média móvel
-    jitter_ewma = 0.0         # EWMA do jitter de rede (alfa = ALPHA_EWMA)
+    buffer: BufferManager = BufferManager()
+    throughput_history: list[float] = []
+    jitter_ewma: float = 0.0
 
-    # Define o caminho do CSV na mesma pasta do script
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    csv_path = os.path.join(script_dir, "metricas_baseline.csv")
+    script_dir: str = os.path.dirname(os.path.abspath(__file__))
+    csv_path: str = os.path.join(script_dir, "metricas_baseline.csv")
     csv_file = open(csv_path, "w", newline="")
     writer = csv.writer(csv_file)
     writer.writerow([
@@ -182,23 +249,17 @@ def main():
     print(f"Iniciando download de {NUM_SEGMENTS} segmentos...")
 
     for seg_num in range(1, NUM_SEGMENTS + 1):
-        # ---- 1. Drenagem do tempo ocioso ----
-        # O buffer é drenado pelo tempo real passado desde o último evento
-        # (fim do download anterior ou início do programa).
+        # Drena o tempo ocioso entre o fim do evento anterior e esta decisão.
         buffer.drain()
 
-        # ---- 2. Decisão ABR (Rate‑Based) ----
-        # Estimativa de vazão: média das últimas N medições (ou menor qualidade se não houver histórico)
         if throughput_history:
             avg_vazao = sum(throughput_history[-ABR_HISTORY_SIZE:]) / len(throughput_history[-ABR_HISTORY_SIZE:])
         else:
-            avg_vazao = representations[0]["bitrate_kbps"]   # começa com a menor qualidade
+            avg_vazao = representations[0]["bitrate_kbps"]
 
-        # Banda segura = estimativa * fator de segurança (para ser conservador)
         safe_bandwidth = avg_vazao * SAFETY_FACTOR
 
-        # Seleciona a maior qualidade cujo bitrate nominal seja <= banda segura
-        chosen_rep = None
+        chosen_rep: Representation | None = None
         for rep in representations:
             if rep["bitrate_kbps"] <= safe_bandwidth:
                 chosen_rep = rep
@@ -207,17 +268,14 @@ def main():
         if chosen_rep is None:
             chosen_rep = representations[0]  # fallback para a mínima
 
-        # ---- 3. buffer_can_play ----
-        # Indica se o buffer atual é suficiente para reprodução contínua
-        # enquanto o próximo segmento é baixado (pelo menos 2s de buffer).
-        buffer_can_play = 1 if buffer.level >= segment_duration else 0
+        # Marca se o player teria conteúdo suficiente para tocar durante outro
+        # segmento inteiro antes de iniciar este download.
+        buffer_can_play: int = 1 if buffer.level >= segment_duration else 0
 
-        # Timestamp do início do download (horário de Brasília, UTC-3)
-        timestamp = datetime.now(timezone(timedelta(hours=-3))).isoformat()
+        timestamp: str = datetime.now(timezone(timedelta(hours=-3))).isoformat()
 
-        # ---- 4. Download do segmento ----
         try:
-            segment_path = f"{chosen_rep['url_path']}?seg={seg_num}"
+            segment_path: str = f"{chosen_rep['url_path']}?seg={seg_num}"
             bytes_rec, download_time, vazao, jitter_net = download_segment_v2(
                 buffer, server_url, segment_path, chosen_rep['bitrate_kbps']
             )
@@ -228,23 +286,17 @@ def main():
             download_time = 1.0
             vazao = 0.0             # vazão zero indica falha
             jitter_net = 0.0
-            # Nota: o buffer não foi drenado durante a tentativa; o próximo buffer.drain()
-            # no início do loop tratará o tempo ocioso.
 
-        # ---- 5. Atualizar histórico de vazão ----
         throughput_history.append(vazao)
         if len(throughput_history) > ABR_HISTORY_SIZE:
             throughput_history.pop(0)
 
-        # ---- 6. Jitter EWMA (suavização exponencial) ----
         jitter_ewma = ALPHA_EWMA * jitter_net + (1 - ALPHA_EWMA) * jitter_ewma
 
-        # ---- 7. Finalizar buffer: adicionar segmento e capturar stall ----
         buffer.add_segment(segment_duration)
-        stall_duration = buffer.get_stall_and_reset()
-        rebuffer_event = 1 if stall_duration > 0 else 0
+        stall_duration: float = buffer.get_stall_and_reset()
+        rebuffer_event: int = 1 if stall_duration > 0 else 0
 
-        # ---- 8. Escrever no CSV ----
         writer.writerow([
             seg_num,
             timestamp,
@@ -259,10 +311,9 @@ def main():
             buffer_can_play,
             rebuffer_event,
             round(stall_duration, 3),
-            0    # failover_total (ainda sem failover nesta entrega)
+            0
         ])
 
-        # Exibe progresso no terminal
         print(f"Seg {seg_num:2d}: {chosen_rep['quality']:5s} "
               f"Vazão={vazao:6.1f} kbps  Buffer={buffer.level:.2f}s  "
               f"Rebuffer={rebuffer_event}")
