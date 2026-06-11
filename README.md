@@ -1,273 +1,184 @@
-# Projeto Final de TR2 - 2026_1
+# Streaming Adaptativo com Controle de Banda
 
-# PROJETO FINAL
+Cliente Python para o projeto final de Teleinformática e Redes 2 (TR2), focado em streaming adaptativo sobre HTTP. O cliente baixa um manifesto, escolhe a qualidade dos segmentos com uma política ABR, mede métricas de rede e salva os resultados em CSV para análise.
 
-## Streaming Adaptativo com Controle de Banda  
-### Adaptive Bitrate (ABR) sobre HTTP
+As especificações completas do trabalho estão em [`especificações.md`](especificações.md).
 
-**Disciplina:** Teleinformática e Redes 2 (TR2)  
-**Grupos:** 3 alunos
+## Estado Atual
 
----
+Implementado:
 
-# 1. Contextualização
+- Parser do manifesto JSON.
+- Modelo de domínio para servidores, representações, manifesto e métricas.
+- Política baseline `RateBasedAbrPolicy`.
+- Download HTTP de segmentos.
+- Medição de vazão por segmento.
+- Estimativa de jitter a partir dos intervalos entre chunks.
+- Média móvel exponencial (EWMA) do jitter.
+- Simulação simples de buffer e detecção de rebuffering.
+- Escrita de métricas em CSV.
+- Geração de gráfico de vazão medida e qualidade escolhida.
+- Seleção de servidor por prioridade e tentativa de failover em erro de download.
 
-O streaming de vídeo adaptativo é hoje a forma dominante de distribuição de conteúdo multimídia na Internet. Plataformas como YouTube, Netflix e Prime Video, dentre outras, utilizam variantes do protocolo DASH (*Dynamic Adaptive Streaming over HTTP*) para ajustar dinamicamente a qualidade do vídeo de acordo com as condições da rede.
+Ainda falta ou está parcial:
 
-Neste projeto, o grupo irá implementar um sistema de streaming adaptativo em Python, com um servidor HTTP com controle programático de banda e variação de atraso (*jitter*), e um cliente com algoritmos de seleção adaptativa de qualidade (ABR). O sistema suporta dois servidores com failover automático e gestão de buffer com estimativa de *continuous play*.
+- Política 2 melhorada, sensível a buffer, jitter ou outra heurística.
+- Política 3 estatística/heurística.
+- Verificação explícita de `/health` antes do failover.
+- Gráficos obrigatórios adicionais: buffer, EWMA de jitter, comparação das três políticas e evento de failover.
+- Experimentos comparativos entre políticas.
+- Captura e análise no Wireshark.
+- Relatório final.
 
----
+## Dependências
 
-## Por que este projeto?
+Requisitos principais:
 
-Serviços como Netflix não transmitem vídeo continuamente: enviam segmentos de 2–4s via HTTP sobre TCP, e o cliente decide a qualidade de cada segmento com base no que observa da rede.
+- Python 3.10+ recomendado.
+- `matplotlib` para gerar gráficos.
+- Wireshark para a etapa de captura e análise TCP.
 
-Entender esse mecanismo exige dominar:
+O cliente baseline usa apenas a biblioteca padrão do Python para rede, CSV e parsing JSON. A dependência externa atual é o `matplotlib`, usado por `analysis/plots.py`.
 
-- HTTP
-- TCP
-- Medição de vazão
-- Gestão de buffer
-- Políticas de decisão adaptativa
+Instalação sugerida:
 
----
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install matplotlib
+```
 
-# 2. Objetivos de Aprendizagem
+No Windows PowerShell:
 
-Ao concluir este projeto, o grupo deverá ser capaz de:
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install matplotlib
+```
 
-- Descrever o funcionamento do HTTP em modo chunked e sua relação com o TCP
-- Implementar um servidor HTTP com controle de taxa de transferência programático
-- Medir vazão e variação de atraso (*jitter*) de uma conexão TCP
-- Implementar gestão de buffer com estimativa de *continuous play*
-- Projetar e implementar pelo menos três algoritmos ABR distintos
-- Implementar failover automático entre servidores
-- Correlacionar eventos da aplicação com comportamentos TCP visíveis no Wireshark
+## Configuração
 
----
-
-# 3. Descrição do Sistema
-
-## 3.1 Arquitetura
-
-| Componente | Responsabilidade | Quem implementa |
-|---|---|---|
-| Servidor A (principal) | Expor manifest, servir segmentos com controle de banda e jitter | Infraestrutura |
-| Servidor B (fallback) | Igual ao servidor A, rodando em porta diferente | Infraestrutura |
-| Cliente | Download, ABR, buffer, failover e métricas | Grupo |
-
----
-
-## 3.2 Manifest v2.0
-
-O manifest é um JSON retornado pelo servidor ao cliente na inicialização.
-
-| Qualidade | Bitrate (kbps) | Segmento | Cenário |
-|---|---|---|---|
-| 240p | 200 | ~25 KB | Conexão limitada |
-| 360p | 400 | ~50 KB | Conexão ruim |
-| 480p | 600 | ~75 KB | Conexão média |
-| 720p | 1000 | ~125 KB | Conexão boa |
-| 1080p | 1200 | ~150 KB | Conexão ótima |
-
----
-
-# 4. Tarefas Obrigatórias
-
-# Tarefa 1 — Baseline (Rate-Based ABR)
-
-Implementar:
-
-- Parser do manifest JSON
-- Medição de vazão
-- Rate-Based ABR
-- BufferManager
-- Registro em CSV
-- Gráficos de vazão e qualidade
-
-### Fórmula do buffer
+Os parâmetros principais ficam em [`config.py`](config.py):
 
 ```python
-buffer += segment_duration
-buffer -= tempo_real_decorrido
+MANIFEST_URL = "http://137.131.178.229:8080/manifest"
+NUM_SEGMENTS = 10
+ABR_HISTORY_SIZE = 5
+SAFETY_FACTOR = 0.8
+ALPHA_EWMA = 0.3
+HTTP_TIMEOUT_S = 10
 ```
 
-### Métricas no CSV
+O manifesto configurado aponta para o servidor principal da infraestrutura do projeto. A especificação também prevê um servidor fallback em:
 
-- Vazão
-- Jitter
-- Buffer
-- Qualidade
-- Rebuffering
-
----
-
-# Tarefa 2 — Política 2 + Failover
-
-A Política 2 deve:
-
-- Identificar deficiências do baseline
-- Implementar melhorias
-- Comparar resultados
-
-### Failover
-
-- Detectar falha
-- Verificar `/health`
-- Migrar para servidor alternativo
-- Registrar evento no CSV
-
----
-
-# Tarefa 3 — Política 3 Estatística/Heurística
-
-A terceira política deve incluir:
-
-- Componente estatístico ou heurístico
-- Tratamento de jitter
-- Comparação com baseline
-
-### Exemplos aceitos
-
-- EWMA
-- Detecção de tendência
-- Desvio padrão
-- Política híbrida
-
----
-
-# Tarefa 4 — Wireshark
-
-- Capturar tráfego TCP
-- Correlacionar TCP com CSV
-- Identificar failover
-- Explicar eventos no relatório
-
----
-
-# 5. Cronograma
-
-| Entrega | Semana | Duração |
-|---|---|---|
-| Entrega 1 | 4 | 10 min |
-| Entrega 2 | 7 | 10 min |
-| Final | 10 | 20–25 min |
-
----
-
-# 6. Relatório Final
-
-## Estrutura obrigatória
-
-1. Introdução
-2. Arquitetura
-3. Baseline
-4. Deficiências
-5. Política 2
-6. Política 3
-7. Failover
-8. Wireshark
-9. Discussão
-10. Conclusão
-
----
-
-## Gráficos obrigatórios
-
-- Vazão + qualidade
-- Buffer
-- EWMA de jitter
-- Comparação das 3 políticas
-- Evento de failover
-
----
-
-# 7. Critérios de Avaliação
-
-| Critério | Peso |
-|---|---|
-| Baseline + Buffer | 15% |
-| Política 2 + Failover | 20% |
-| Política 3 | 20% |
-| Wireshark | 15% |
-| Relatório | 15% |
-| Apresentação | 15% |
-
----
-
-# 8. Infraestrutura
-
-## Requisitos
-
-- Python 3.6+
-- Wireshark
-- matplotlib
-
----
-
-## Servidores
-
-### Servidor A
-
-```txt
-http://137.131.178.229:8080
-```
-
-### Servidor B
-
-```txt
+```text
 http://137.131.178.229:8081
 ```
 
-### Manifest
+## Como Executar
 
-```txt
-http://137.131.178.229:8080/manifest
+Para rodar o experimento baseline:
+
+```bash
+python3 main.py
 ```
 
----
+O resultado é salvo em:
 
-# 8.3 Métricas CSV
+```text
+outputs/metricas_baseline.csv
+```
+
+Para gerar o gráfico de vazão e qualidade:
+
+```bash
+python3 scripts/plot_baseline.py
+```
+
+Por padrão, o gráfico é salvo em:
+
+```text
+outputs/plots/grafico_vazao_qualidade.png
+```
+
+Também é possível informar caminhos manualmente:
+
+```bash
+python3 scripts/plot_baseline.py --csv outputs/metricas_baseline.csv --output outputs/plots/grafico_vazao_qualidade.png
+```
+
+## Estrutura do Projeto
+
+```text
+.
+├── abr/                  # Políticas ABR
+├── analysis/             # Leitura de métricas e geração de gráficos
+├── domain/               # Modelos de manifesto e métricas
+├── experiment/           # Runner do experimento e escrita CSV
+├── failover/             # Seleção de servidores por prioridade
+├── network/              # Cliente de manifesto e downloader de segmentos
+├── player/               # Gerenciamento de buffer
+├── scripts/              # Scripts de linha de comando
+├── config.py             # Constantes de configuração
+├── main.py               # Entrada do experimento baseline
+└── especificações.md     # Enunciado/escopo do projeto
+```
+
+## Métricas Geradas
+
+O CSV atual contém uma linha por segmento com os campos:
 
 | Campo | Descrição |
 |---|---|
-| segment | Número do segmento |
-| timestamp | Horário |
-| server_id | Servidor |
-| quality | Qualidade |
-| bitrate_kbps | Bitrate |
-| throughput_kbps | Vazão |
-| jitter_ms | Jitter |
-| buffer_level_s | Buffer |
-| rebuffer_event | Rebuffer |
-| failover_total | Total de failovers |
+| `segment` | Número sequencial do segmento |
+| `timestamp` | Horário da medição em ISO 8601 |
+| `server_id` | Servidor usado no download |
+| `quality` | Qualidade escolhida pela política ABR |
+| `bitrate_kbps` | Bitrate nominal da representação |
+| `vazao_kbps` | Vazão medida durante o download |
+| `download_time_s` | Tempo total de download |
+| `jitter_network_ms` | Jitter medido entre chunks HTTP |
+| `jitter_ewma_ms` | EWMA do jitter |
+| `buffer_level_s` | Nível do buffer após baixar o segmento |
+| `buffer_can_play` | Indica se havia buffer suficiente para reprodução contínua |
+| `rebuffer_event` | Indica ocorrência de rebuffering |
+| `stall_duration_s` | Duração acumulada do stall |
+| `failover_total` | Total acumulado de failovers |
 
----
+## Política Baseline
 
-# 9. Dicas
+A política baseline está em [`abr/rate_based.py`](abr/rate_based.py). Ela calcula a média das últimas vazões medidas e aplica um fator de segurança:
 
-## Dica 1
+```text
+vazao_segura = media_vazao_recente * SAFETY_FACTOR
+```
 
-Comece pelo baseline.
+Depois escolhe a maior representação cujo bitrate nominal seja menor ou igual à vazão segura. Quando ainda não há histórico, a política começa pela menor representação disponível.
 
-## Dica 2
+## Buffer
 
-O CSV é a base do projeto.
+O buffer é atualizado de forma aproximada usando tempo real decorrido durante o download:
 
-## Dica 3
+```text
+buffer -= tempo_real_decorrido
+buffer += duracao_do_segmento
+```
 
-Wireshark e CSV devem estar sincronizados.
+Se o consumo ultrapassa o nível disponível, o cliente registra stall e marca um evento de rebuffering.
 
-## Dica 4
+## Failover
 
-Compare com dados reais.
+O projeto já tem `PriorityServerSelector`, que ordena servidores por prioridade e troca para o próximo servidor quando ocorre erro no download. No estado atual, essa troca é feita sem chamada explícita a `/health`, então a parte de failover ainda deve ser completada para atender totalmente à especificação.
 
----
+## Arquivos Gerados
 
-# 10. Integridade Acadêmica
+Arquivos em `outputs/`, caches Python, `.venv/` e capturas Wireshark são ignorados pelo Git. Para compartilhar resultados finais, gere os arquivos localmente ou adicione exceções específicas no `.gitignore`.
 
-O uso de IA é permitido desde que:
+## Próximos Passos
 
-- O grupo compreenda o código
-- As análises sejam reais
-- Os dados sejam da apresentação real
+1. Implementar uma política ABR sensível ao buffer em `abr/buffer_aware.py`.
+2. Implementar uma terceira política estatística/heurística em `abr/rnn_policy.py` ou em novo módulo.
+3. Adicionar verificação `/health` no failover.
+4. Gerar gráficos de buffer, jitter EWMA, comparação de políticas e failover.
+5. Rodar cenários comparativos e salvar conclusões para o relatório.
+6. Capturar tráfego no Wireshark e correlacionar os eventos TCP com o CSV.

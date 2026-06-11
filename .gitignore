@@ -1,3 +1,40 @@
-/.agents
-/.codex
-*/__pycache__
+# Local Codex/agent state
+/.agents/
+/.codex/
+
+# Python bytecode and caches
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Generated experiment outputs
+outputs/*.csv
+outputs/plots/*.png
+
+# Wireshark captures
+*.pcap
+*.pcapng
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
