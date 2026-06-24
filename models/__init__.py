@@ -1,7 +1,15 @@
 """Modelos neurais usados pelas políticas de streaming."""
 
+from typing import TYPE_CHECKING
 
-def __getattr__(name: str):
+if TYPE_CHECKING:
+    from models.checkpoint import LoadedRnnModel
+    from models.dataset import FeatureNormalizer, RnnSample, StreamingRnnDataset
+    from models.rnn import StreamingRNN
+    from models.train import EpochMetrics, TrainConfig
+
+
+def __getattr__(name: str) -> object:
     if name == "StreamingRNN":
         from models.rnn import StreamingRNN
 

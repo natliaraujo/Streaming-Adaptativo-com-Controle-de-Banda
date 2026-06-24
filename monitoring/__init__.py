@@ -1,5 +1,7 @@
 """Monitoramento de servidores e montagem de features para políticas."""
 
+from typing import TYPE_CHECKING
+
 from monitoring.observation_store import ObservationStore, ServerObservation
 from monitoring.server_monitor import MonitorConfig, ServerMonitor
 from monitoring.fault_injecting_store import (
@@ -9,8 +11,11 @@ from monitoring.fault_injecting_store import (
     build_random_fault_schedule,
 )
 
+if TYPE_CHECKING:
+    from monitoring.feature_builder import FeatureConfig, FeatureHistory, PlayerState
 
-def __getattr__(name: str):
+
+def __getattr__(name: str) -> object:
     if name in {"FeatureConfig", "FeatureHistory", "PlayerState"}:
         from monitoring import feature_builder
 
