@@ -1,14 +1,46 @@
-"""Orquestração do experimento de streaming adaptativo."""
+"""Coordena políticas, downloads, buffer, failover e métricas do experimento."""
 
-from datetime import datetime, timezone, timedelta
+import time
+from datetime import datetime, timedelta, timezone
 
-from abr.base import AbrPolicy
-from domain.manifest import Manifest
+from config import (
+    BUFFER_CRITICAL_S,
+    BUFFER_MAX_S,
+    BUFFER_MIN_S,
+    BUFFER_TARGET_S,
+    HEALTH_CHECK_TIMEOUT_S,
+    NETWORK_RECOVERY_MAX_WAIT_S,
+    NETWORK_RETRY_DELAY_S,
+)
+from domain.action import StreamingAction
+from domain.manifest import Manifest, Representation, ServerInfo
 from domain.metrics import SegmentMetrics
 from experiment.csv_writer import CsvMetricsWriter
-from failover.server_selector import PriorityServerSelector
-from network.segment_downloader import download_segment
+from monitoring.observation_store import ObservationStore, ServerObservation
+from network.segment_downloader import DownloadResult, download_segment
+from network.server_probe import probe_server_health
 from player.buffer import BufferManager
+from policy.streaming_policy import StreamingPolicy
+
+
+def estimate_download_time_s(
+    segment_bytes: int,
+    throughput_kbps: float | None,
+) -> float:
+    """Estima o tempo necessário para baixar um segmento.
+
+    Args:
+        segment_bytes: Tamanho nominal do segmento em bytes.
+        throughput_kbps: Vazão estimada em kilobits por segundo.
+
+    Returns:
+        Tempo estimado em segundos, ou infinito quando a vazão é ausente ou não
+        positiva.
+    """
+    if throughput_kbps is None or throughput_kbps <= 0.0:
+        return float("inf")
+
+    return (segment_bytes * 8) / (throughput_kbps * 1000.0)
 
 
 class ExperimentRunner:
@@ -17,126 +49,461 @@ class ExperimentRunner:
     def __init__(
         self,
         manifest: Manifest,
-        abr_policy: AbrPolicy,
+        policy: StreamingPolicy,
         csv_writer: CsvMetricsWriter,
         num_segments: int,
         alpha_ewma: float,
+        observation_store: ObservationStore | None = None,
     ) -> None:
-        """
-        Prepara os componentes necessários para rodar o experimento.
+        """Prepara o estado compartilhado de uma execução.
+
+        O runner cria um buffer vazio, inicia as EWMAs sem histórico e mantém a
+        lista de servidores falhos entre segmentos para evitar novas tentativas
+        enquanto o endpoint de saúde não indicar recuperação.
 
         Args:
-            manifest: Manifesto com servidores, representações e duração.
-            abr_policy: Política usada para escolher a qualidade de cada segmento.
-            csv_writer: Escritor responsável por persistir as métricas.
-            num_segments: Quantidade de segmentos que serão baixados.
-            alpha_ewma: Peso da amostra atual no cálculo de jitter EWMA.
+            manifest: Servidores, representações e duração dos segmentos.
+            policy: Estratégia que escolhe servidor e representação.
+            csv_writer: Destino das métricas produzidas.
+            num_segments: Quantidade de segmentos do experimento.
+            alpha_ewma: Peso da amostra mais recente nas EWMAs.
+            observation_store: Snapshot opcional dos monitores de servidor.
         """
+        self.manifest: Manifest = manifest
+        self.policy: StreamingPolicy = policy
+        self.csv_writer: CsvMetricsWriter = csv_writer
+        self.num_segments: int = num_segments
+        self.alpha_ewma: float = alpha_ewma
+        self.observation_store: ObservationStore | None = observation_store
 
-        self.manifest = manifest
-        self.abr_policy = abr_policy
-        self.csv_writer = csv_writer
-        self.num_segments = num_segments
-        self.alpha_ewma = alpha_ewma
-
-        self.buffer = BufferManager()
-        self.server_selector = PriorityServerSelector(manifest.servers)
+        self.buffer = BufferManager(
+            max_level_s=BUFFER_MAX_S,
+            target_level_s=BUFFER_TARGET_S,
+            min_level_s=BUFFER_MIN_S,
+            critical_level_s=BUFFER_CRITICAL_S,
+        )
         self.throughput_history_kbps: list[float] = []
+        self.throughput_ewma_kbps: float | None = None
         self.jitter_ewma_ms: float = 0.0
+        self.failover_total: int = 0
+        self.failed_server_ids: set[str] = set()
 
     def run(self) -> None:
-        """
-        Executa o ciclo de seleção ABR, download, failover e coleta de métricas.
+        """Executa todos os segmentos e fecha o CSV mesmo em caso de erro.
 
-        Para cada segmento, a política escolhe uma representação, o downloader
-        mede a rede, o buffer é atualizado e uma linha é escrita no CSV. Em caso
-        de falha no servidor atual, o runner tenta o próximo servidor por
-        prioridade.
+        A lista de representações é impressa antes do loop para tornar explícitos
+        os bitrates realmente recebidos do manifesto.
         """
-
         print(f"Iniciando download de {self.num_segments} segmentos...")
+        print("Representações disponíveis no manifest:")
+        for representation in self.manifest.representations:
+            print(f"  {representation.quality}: {representation.bitrate_kbps} kbps")
 
-        for seg_num in range(1, self.num_segments + 1):
-            self.buffer.drain()
+        try:
+            for seg_num in range(1, self.num_segments + 1):
+                self._run_segment(seg_num)
+        finally:
+            self.csv_writer.close()
 
-            chosen_rep = self.abr_policy.select_representation(
-                representations=self.manifest.representations,
-                throughput_history_kbps=self.throughput_history_kbps,
-                buffer_level_s=self.buffer.level_s,
-                segment_duration_s=self.manifest.segment_duration_s,
+    def _run_segment(self, seg_num: int) -> None:
+        """Executa o ciclo completo de uma amostra do experimento.
+
+        A ordem estratégica é: coletar observações, consultar a política, baixar
+        com recuperação de rede, atualizar EWMAs, consumir o tempo real da
+        operação, adicionar o segmento, controlar o buffer cheio e persistir as
+        métricas.
+
+        Args:
+            seg_num: Número sequencial do segmento, iniciado em um.
+        """
+        observations: dict[str, ServerObservation] = self._get_observations()
+        self._refresh_failed_servers()
+
+        action: StreamingAction = self.policy.select_action(
+            manifest=self.manifest,
+            buffer=self.buffer,
+            observations=observations,
+            throughput_history_kbps=self.throughput_history_kbps,
+            throughput_ewma_kbps=self.throughput_ewma_kbps,
+        )
+
+        server: ServerInfo = self._redirect_if_failed(action.server)
+        chosen_rep: Representation = action.representation
+        segment_path: str = f"{chosen_rep.url_path}?seg={seg_num}"
+        timestamp: str = datetime.now(
+            timezone(timedelta(hours=-3))
+        ).isoformat()
+
+        (
+            result,
+            server,
+            failover_event,
+            failover_duration_s,
+            playback_elapsed_s,
+        ) = (
+            self._download_with_failover(
+                server=server,
+                path=segment_path,
+                nominal_bitrate_kbps=chosen_rep.bitrate_kbps,
+                seg_num=seg_num,
             )
+        )
 
-            server = self.server_selector.get_current_server()
+        self.throughput_history_kbps.append(result.throughput_kbps)
+        self._update_ewmas(result)
 
-            buffer_can_play = int(
-                self.buffer.level_s >= self.manifest.segment_duration_s
-            )
+        # Simulação explícita do player durante e após o download.
+        self.buffer.consume(playback_elapsed_s)
+        self.buffer.add_segment(self.manifest.segment_duration_s)
 
-            timestamp = datetime.now(
-                timezone(timedelta(hours=-3))
-            ).isoformat()
+        stall_duration_s: float = self.buffer.get_stall_and_reset()
+        rebuffer_event: int = int(stall_duration_s > 0.0)
 
+        estimated_next_download_time_s: float = estimate_download_time_s(
+            segment_bytes=chosen_rep.segment_bytes,
+            throughput_kbps=self.throughput_ewma_kbps or result.throughput_kbps,
+        )
+        buffer_can_play: int = int(
+            self.buffer.level_s > estimated_next_download_time_s
+        )
+
+        playback_wait_s: float = self.buffer.wait_if_full(
+            resume_margin_s=self.manifest.segment_duration_s
+        )
+
+        self.policy.update_last_download_state(
+            bitrate_kbps=chosen_rep.bitrate_kbps,
+            download_time_s=result.download_time_s,
+            rebuffer_event=rebuffer_event,
+            server_index=self._server_index(server.id),
+        )
+
+        metrics = self._build_metrics(
+            seg_num=seg_num,
+            timestamp=timestamp,
+            server=server,
+            representation=chosen_rep,
+            result=result,
+            buffer_can_play=buffer_can_play,
+            rebuffer_event=rebuffer_event,
+            stall_duration_s=stall_duration_s,
+            playback_wait_s=playback_wait_s,
+            failover_event=failover_event,
+            failover_duration_s=failover_duration_s,
+            observations=observations,
+        )
+        self.csv_writer.write(metrics)
+
+        print(
+            f"Seg {seg_num:3d}: {chosen_rep.quality:5s} "
+            f"Servidor={server.id:5s} "
+            f"Vazão={result.throughput_kbps:7.1f} kbps "
+            f"EWMA={self.throughput_ewma_kbps:7.1f} kbps "
+            f"Buffer={self.buffer.level_s:5.2f}s "
+            f"Rebuffer={rebuffer_event} Failover={failover_event}"
+        )
+
+    def _download_with_failover(
+        self,
+        server: ServerInfo,
+        path: str,
+        nominal_bitrate_kbps: int,
+        seg_num: int,
+    ) -> tuple[DownloadResult, ServerInfo, int, float, float]:
+        """Baixa um segmento, alternando servidores durante indisponibilidade.
+
+        Uma falha marca o servidor atual, inicia a medição do failover e procura
+        um alternativo aprovado por ``/health``. Se todos estiverem fora do ar,
+        aguarda a recuperação sem avançar o número do segmento. O tempo total da
+        operação é retornado para que a queda seja consumida pelo buffer.
+
+        Args:
+            server: Servidor escolhido originalmente pela política.
+            path: Caminho HTTP do segmento, incluindo a query string.
+            nominal_bitrate_kbps: Bitrate usado pelo downloader como fallback.
+            seg_num: Número do segmento, usado nas mensagens de diagnóstico.
+
+        Returns:
+            Tupla com resultado do download, servidor efetivamente usado,
+            indicador de failover, duração do failover e tempo total percebido
+            pelo player.
+
+        Raises:
+            RuntimeError: Se nenhum servidor se recuperar dentro do limite
+                configurado.
+        """
+        operation_started_s: float = time.monotonic()
+        recovery_deadline_s: float = (
+            operation_started_s + NETWORK_RECOVERY_MAX_WAIT_S
+        )
+        failover_event: int = 0
+        failover_started_s: float | None = None
+        failover_duration_s: float = 0.0
+
+        while True:
             try:
-                segment_path = f"{chosen_rep.url_path}?seg={seg_num}"
-
                 result = download_segment(
-                    buffer=self.buffer,
                     server_url=server.url,
-                    path=segment_path,
-                    nominal_bitrate_kbps=chosen_rep.bitrate_kbps,
+                    path=path,
+                    nominal_bitrate_kbps=nominal_bitrate_kbps,
                 )
-
-            except Exception as e:
-                print(f"Erro no segmento {seg_num} usando servidor {server.id}: {e}")
-
-                server = self.server_selector.mark_failed_and_switch()
-
-                segment_path = f"{chosen_rep.url_path}?seg={seg_num}"
-
-                result = download_segment(
-                    buffer=self.buffer,
-                    server_url=server.url,
-                    path=segment_path,
-                    nominal_bitrate_kbps=chosen_rep.bitrate_kbps,
+                playback_elapsed_s: float = (
+                    time.monotonic() - operation_started_s
                 )
+                return (
+                    result,
+                    server,
+                    failover_event,
+                    failover_duration_s,
+                    playback_elapsed_s,
+                )
+            except Exception as exc:
+                print(
+                    f"Erro no segmento {seg_num} usando servidor "
+                    f"{server.id}: {exc}"
+                )
+                self.failed_server_ids.add(server.id)
 
-            self.throughput_history_kbps.append(result.throughput_kbps)
+                if failover_started_s is None:
+                    failover_started_s = time.monotonic()
 
-            self.jitter_ewma_ms = (
-                self.alpha_ewma * result.jitter_network_ms
-                + (1 - self.alpha_ewma) * self.jitter_ewma_ms
+                fallback_server = self._wait_for_healthy_fallback_server(
+                    failed_server_id=server.id,
+                    deadline_s=recovery_deadline_s,
+                )
+                if fallback_server is None:
+                    raise RuntimeError(
+                        "A rede não se recuperou dentro de "
+                        f"{NETWORK_RECOVERY_MAX_WAIT_S:.0f}s."
+                    ) from exc
+
+                server = fallback_server
+                failover_event = 1
+                self.failover_total += 1
+                failover_duration_s = time.monotonic() - failover_started_s
+
+    def _update_ewmas(self, result: DownloadResult) -> None:
+        """Atualiza as EWMAs após um download bem-sucedido.
+
+        A primeira amostra inicializa a EWMA de vazão diretamente. As amostras
+        seguintes combinam medição atual e histórico pelo ``alpha_ewma``.
+
+        Args:
+            result: Métricas de rede do segmento concluído.
+        """
+        if self.throughput_ewma_kbps is None:
+            self.throughput_ewma_kbps = result.throughput_kbps
+        else:
+            self.throughput_ewma_kbps = (
+                self.alpha_ewma * result.throughput_kbps
+                + (1.0 - self.alpha_ewma) * self.throughput_ewma_kbps
             )
 
-            self.buffer.add_segment(self.manifest.segment_duration_s)
+        self.jitter_ewma_ms = (
+            self.alpha_ewma * result.jitter_network_ms
+            + (1.0 - self.alpha_ewma) * self.jitter_ewma_ms
+        )
 
-            stall_duration_s = self.buffer.get_stall_and_reset()
-            rebuffer_event = int(stall_duration_s > 0)
+    def _refresh_failed_servers(self) -> None:
+        """Revalida servidores falhos antes da próxima decisão.
 
-            metrics = SegmentMetrics(
-                segment=seg_num,
-                timestamp=timestamp,
-                server_id=server.id,
-                quality=chosen_rep.quality,
-                bitrate_kbps=chosen_rep.bitrate_kbps,
-                throughput_kbps=result.throughput_kbps,
-                download_time_s=result.download_time_s,
-                jitter_network_ms=result.jitter_network_ms,
-                jitter_ewma_ms=self.jitter_ewma_ms,
-                buffer_level_s=self.buffer.level_s,
-                buffer_can_play=buffer_can_play,
-                rebuffer_event=rebuffer_event,
-                stall_duration_s=stall_duration_s,
-                failover_total=self.server_selector.failover_total,
-            )
+        Um servidor só volta a ser elegível quando seu endpoint ``/health``
+        responde positivamente.
+        """
+        for server in self.manifest.servers:
+            if server.id not in self.failed_server_ids:
+                continue
+            if probe_server_health(
+                server,
+                timeout_s=HEALTH_CHECK_TIMEOUT_S,
+            ).ok:
+                self.failed_server_ids.remove(server.id)
 
-            self.csv_writer.write(metrics)
+    def _redirect_if_failed(self, server: ServerInfo) -> ServerInfo:
+        """Redireciona uma escolha que aponta para servidor ainda falho.
 
+        Args:
+            server: Servidor selecionado pela política.
+
+        Returns:
+            Alternativo saudável, quando disponível. Caso nenhum health check
+            confirme um alternativo, retorna o servidor original para permitir
+            uma tentativa real de recuperação.
+        """
+        if server.id not in self.failed_server_ids:
+            return server
+
+        fallback = self._choose_healthy_fallback_server(server.id)
+        if fallback is None:
+            # A tentativa real ainda pode funcionar mesmo se o health check oscilar.
+            return server
+        return fallback
+
+    def _wait_for_healthy_fallback_server(
+        self,
+        failed_server_id: str,
+        deadline_s: float,
+    ) -> ServerInfo | None:
+        """Aguarda um servidor alternativo ficar saudável.
+
+        Args:
+            failed_server_id: Servidor que falhou na tentativa mais recente.
+            deadline_s: Instante monotônico máximo para encerrar a espera.
+
+        Returns:
+            Primeiro alternativo saudável por prioridade, ou ``None`` ao atingir
+            o prazo.
+        """
+        while True:
+            fallback = self._choose_healthy_fallback_server(failed_server_id)
+            if fallback is not None:
+                return fallback
+
+            remaining_s: float = deadline_s - time.monotonic()
+            if remaining_s <= 0.0:
+                return None
+
+            wait_s: float = min(NETWORK_RETRY_DELAY_S, remaining_s)
             print(
-                f"Seg {seg_num:2d}: {chosen_rep.quality:5s} "
-                f"Servidor={server.id:5s} "
-                f"Vazão={result.throughput_kbps:6.1f} kbps "
-                f"Buffer={self.buffer.level_s:.2f}s "
-                f"Rebuffer={rebuffer_event}"
+                "Todos os servidores estão indisponíveis; "
+                f"nova tentativa em {wait_s:.1f}s..."
             )
+            time.sleep(wait_s)
 
-        self.csv_writer.close()
+    def _choose_healthy_fallback_server(
+        self,
+        failed_server_id: str,
+    ) -> ServerInfo | None:
+        """Procura uma alternativa saudável seguindo a prioridade do manifesto.
+
+        Args:
+            failed_server_id: Servidor que não deve ser selecionado nesta busca.
+
+        Returns:
+            Primeiro servidor com health check positivo, ou ``None`` quando não
+            houver candidato saudável.
+        """
+        candidates = sorted(self.manifest.servers, key=lambda item: item.priority)
+        for candidate in candidates:
+            if candidate.id == failed_server_id:
+                continue
+            if probe_server_health(
+                candidate,
+                timeout_s=HEALTH_CHECK_TIMEOUT_S,
+            ).ok:
+                self.failed_server_ids.discard(candidate.id)
+                return candidate
+        return None
+
+    def _get_observations(self) -> dict[str, ServerObservation]:
+        """Obtém um snapshot consistente das observações de monitoramento.
+
+        Returns:
+            Cópia das observações indexada por servidor, ou dicionário vazio
+            quando o experimento não usa monitores.
+        """
+        if self.observation_store is None:
+            return {}
+        return self.observation_store.snapshot()
+
+    def _server_index(self, server_id: str) -> int:
+        """Converte o identificador do servidor para a posição no manifesto.
+
+        Args:
+            server_id: Identificador textual procurado.
+
+        Returns:
+            Índice do servidor, usado pelas features da Política 3.
+
+        Raises:
+            ValueError: Se o servidor não fizer parte do manifesto.
+        """
+        for index, server in enumerate(self.manifest.servers):
+            if server.id == server_id:
+                return index
+        raise ValueError(f"Servidor não encontrado no manifest: {server_id}")
+
+    def _build_metrics(
+        self,
+        seg_num: int,
+        timestamp: str,
+        server: ServerInfo,
+        representation: Representation,
+        result: DownloadResult,
+        buffer_can_play: int,
+        rebuffer_event: int,
+        stall_duration_s: float,
+        playback_wait_s: float,
+        failover_event: int,
+        failover_duration_s: float,
+        observations: dict[str, ServerObservation],
+    ) -> SegmentMetrics:
+        """Consolida estado do player, rede, failover e probes em uma amostra.
+
+        Args:
+            seg_num: Número sequencial do segmento.
+            timestamp: Horário ISO 8601 do início da operação.
+            server: Servidor que concluiu o download.
+            representation: Qualidade escolhida para o segmento.
+            result: Medições do download bem-sucedido.
+            buffer_can_play: Indicador de sobrevivência ao próximo download.
+            rebuffer_event: Indicador de stall no segmento.
+            stall_duration_s: Duração acumulada do stall.
+            playback_wait_s: Pausa feita por buffer cheio.
+            failover_event: Indicador de troca de servidor.
+            failover_duration_s: Tempo para confirmar o alternativo.
+            observations: Snapshot dos probes no momento da decisão.
+
+        Returns:
+            Estrutura imutável pronta para persistência no CSV.
+        """
+        obs_a = self._observation_by_index(observations, 0)
+        obs_b = self._observation_by_index(observations, 1)
+
+        return SegmentMetrics(
+            segment=seg_num,
+            timestamp=timestamp,
+            server_id=server.id,
+            quality=representation.quality,
+            bitrate_kbps=representation.bitrate_kbps,
+            throughput_kbps=result.throughput_kbps,
+            throughput_ewma_kbps=self.throughput_ewma_kbps,
+            download_time_s=result.download_time_s,
+            jitter_network_ms=result.jitter_network_ms,
+            jitter_ewma_ms=self.jitter_ewma_ms,
+            buffer_level_s=self.buffer.level_s,
+            buffer_can_play=buffer_can_play,
+            rebuffer_event=rebuffer_event,
+            stall_duration_s=stall_duration_s,
+            playback_wait_s=playback_wait_s,
+            failover_event=failover_event,
+            failover_duration_s=failover_duration_s,
+            failover_total=self.failover_total,
+            probe_a_ok=None if obs_a is None else int(obs_a.success),
+            probe_a_latency_ms=None if obs_a is None else obs_a.latency_ms,
+            probe_a_throughput_kbps=None if obs_a is None else obs_a.throughput_kbps,
+            probe_a_jitter_ms=None if obs_a is None else obs_a.jitter_ms,
+            probe_b_ok=None if obs_b is None else int(obs_b.success),
+            probe_b_latency_ms=None if obs_b is None else obs_b.latency_ms,
+            probe_b_throughput_kbps=None if obs_b is None else obs_b.throughput_kbps,
+            probe_b_jitter_ms=None if obs_b is None else obs_b.jitter_ms,
+        )
+
+    def _observation_by_index(
+        self,
+        observations: dict[str, ServerObservation],
+        index: int,
+    ) -> ServerObservation | None:
+        """Obtém a observação associada a uma posição do manifesto.
+
+        Args:
+            observations: Snapshot indexado por identificador.
+            index: Posição esperada do servidor no manifesto.
+
+        Returns:
+            Observação correspondente, ou ``None`` se o índice ou a observação
+            não estiver disponível.
+        """
+        if index >= len(self.manifest.servers):
+            return None
+        return observations.get(self.manifest.servers[index].id)

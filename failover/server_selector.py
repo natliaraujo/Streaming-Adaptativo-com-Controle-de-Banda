@@ -11,7 +11,7 @@ class PriorityServerSelector:
         Ordena os servidores por prioridade e seleciona o primeiro.
 
         Raises:
-            ValueError: Se a lista de servidores estiver vazia.
+            - `ValueError`: Se a lista de servidores estiver vazia.
         """
 
         if not servers:
@@ -31,7 +31,7 @@ class PriorityServerSelector:
         Registra falha no servidor atual e troca para o próximo fallback.
 
         Raises:
-            RuntimeError: Se não houver outro servidor disponível.
+            - `RuntimeError`: Se não houver outro servidor disponível.
         """
 
         if self.current_index + 1 >= len(self.servers):

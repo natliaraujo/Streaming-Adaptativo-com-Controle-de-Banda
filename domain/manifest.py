@@ -1,4 +1,13 @@
-"""Modelos imutáveis que representam o manifesto do serviço de streaming."""
+"""
+Define as estruturas de dados que representam o Manifest v2.0 do sistema.
+
+O manifest descreve os servidores disponíveis, suas prioridades e parâmetros
+de rede declarados, além das representações de qualidade disponíveis para os
+segmentos de vídeo.
+
+Este módulo contém apenas modelos de domínio imutáveis, sem lógica de rede,
+download ou decisão de política.
+"""
 
 from dataclasses import dataclass
 

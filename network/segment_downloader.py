@@ -1,4 +1,12 @@
-"""Download HTTP de segmentos e cálculo de métricas de rede."""
+"""
+Realiza o download HTTP dos segmentos de vídeo e mede métricas de rede.
+
+Durante o download, este módulo contabiliza bytes recebidos, tempo total de
+transferência, vazão observada e jitter no nível da aplicação.
+
+O módulo não decide qual servidor ou qualidade usar; ele apenas executa a ação
+definida pela política de streaming.
+"""
 
 import http.client
 import statistics
@@ -7,7 +15,6 @@ from dataclasses import dataclass
 from urllib.parse import urlparse
 
 from config import HTTP_TIMEOUT_S
-from player.buffer import BufferManager
 
 
 @dataclass(frozen=True)
@@ -28,7 +35,6 @@ class DownloadResult:
 
 
 def download_segment(
-    buffer: BufferManager,
     server_url: str,
     path: str,
     nominal_bitrate_kbps: int,
@@ -36,22 +42,18 @@ def download_segment(
     """
     Baixa um segmento via HTTP e mede vazão, tempo e jitter.
 
-    Durante a leitura dos chunks, o buffer é drenado para aproximar o consumo de
-    reprodução enquanto o cliente aguarda a chegada do segmento.
-
     Args:
-        buffer: Gerenciador de buffer que será atualizado durante o download.
-        server_url: URL base do servidor escolhido.
-        path: Caminho HTTP do segmento, incluindo query string quando houver.
-        nominal_bitrate_kbps: Bitrate usado como fallback se o tempo medido for
-            zero.
+        - `server_url`: URL base do servidor escolhido.
+        - `path`: Caminho HTTP do segmento, incluindo query string quando houver.
+        - `nominal_bitrate_kbps`: Bitrate usado como fallback se o tempo medido
+        for zero.
 
     Returns:
         Métricas de rede coletadas para o segmento.
 
     Raises:
-        ValueError: Se a URL do servidor não possuir host.
-        Exception: Se a resposta HTTP não for 200.
+        - `ValueError`: Se a URL do servidor não possuir host.
+        - `Exception`: Se a resposta HTTP não for 200.
     """
 
     url_parts = urlparse(server_url)
@@ -64,6 +66,7 @@ def download_segment(
     conn = http.client.HTTPConnection(host, port, timeout=HTTP_TIMEOUT_S)
 
     try:
+        start_download = time.monotonic()
         conn.request("GET", path)
         response = conn.getresponse()
 
@@ -73,9 +76,7 @@ def download_segment(
         bytes_received = 0
         chunk_intervals: list[float] = []
 
-        buffer.start_download()
-        start_download = time.time()
-        last_chunk_time = start_download
+        last_chunk_time = time.monotonic()
 
         while True:
             chunk = response.read(1024)
@@ -83,15 +84,13 @@ def download_segment(
             if not chunk:
                 break
 
-            now = time.time()
-
-            buffer.drain()
+            now = time.monotonic()
             chunk_intervals.append(now - last_chunk_time)
             last_chunk_time = now
 
             bytes_received += len(chunk)
 
-        download_time_s = time.time() - start_download
+        download_time_s = time.monotonic() - start_download
 
         if download_time_s > 0:
             throughput_kbps = (bytes_received * 8) / (download_time_s * 1000)

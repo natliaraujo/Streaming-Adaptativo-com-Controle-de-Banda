@@ -1,50 +1,43 @@
-"""Modelo de métricas coletadas para cada segmento baixado."""
+"""
+Define as métricas coletadas durante os experimentos.
+
+As métricas descrevem o resultado observado para cada segmento baixado,
+incluindo qualidade, servidor, vazão, jitter, buffer, rebuffering e, quando
+disponível, observações dos servidores usadas pela política RNN.
+"""
 
 from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
 class SegmentMetrics:
-    """Conjunto de medições gravadas no CSV para um segmento."""
+    """Métricas registradas para um segmento."""
 
     segment: int
-    """Número sequencial do segmento no experimento."""
-
     timestamp: str
-    """Instante de coleta em ISO 8601."""
-
     server_id: str
-    """Identificador do servidor usado no download."""
-
     quality: str
-    """Qualidade escolhida pela política ABR."""
-
     bitrate_kbps: int
-    """Bitrate nominal da representação escolhida."""
-
     throughput_kbps: float
-    """Vazão efetiva medida durante o download."""
-
+    throughput_ewma_kbps: float | None
     download_time_s: float
-    """Duração total do download em segundos."""
-
     jitter_network_ms: float
-    """Jitter calculado a partir dos intervalos entre chunks HTTP."""
-
     jitter_ewma_ms: float
-    """Média móvel exponencial do jitter de rede."""
-
     buffer_level_s: float
-    """Nível do buffer após adicionar o segmento baixado."""
-
     buffer_can_play: int
-    """Indicador inteiro de buffer suficiente para reproduzir um segmento."""
-
     rebuffer_event: int
-    """Indicador inteiro de ocorrência de rebuffering no segmento."""
-
     stall_duration_s: float
-    """Tempo acumulado de stall observado durante o download."""
-
+    playback_wait_s: float
+    failover_event: int
+    failover_duration_s: float
     failover_total: int
-    """Quantidade acumulada de trocas para servidores de fallback."""
+
+    probe_a_ok: int | None = None
+    probe_a_latency_ms: float | None = None
+    probe_a_throughput_kbps: float | None = None
+    probe_a_jitter_ms: float | None = None
+
+    probe_b_ok: int | None = None
+    probe_b_latency_ms: float | None = None
+    probe_b_throughput_kbps: float | None = None
+    probe_b_jitter_ms: float | None = None
