@@ -15,7 +15,7 @@ PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from config import ALPHA_EWMA, MANIFEST_URL, NUM_SEGMENTS, SAFETY_FACTOR  # noqa: E402
+from config import ALPHA_JITTER_EWMA, ALPHA_THROUGHPUT_EWMA, MANIFEST_URL, NUM_SEGMENTS, SAFETY_FACTOR  # noqa: E402
 from experiment import CsvMetricsWriter, ExperimentRunner  # noqa: E402
 from models.checkpoint import LoadedRnnModel, load_rnn_checkpoint  # noqa: E402
 from monitoring.feature_builder import FeatureConfig, FeatureHistory  # noqa: E402
@@ -95,7 +95,8 @@ def main() -> None:
         observation_store=observation_store,
         csv_writer=csv_writer,
         num_segments=NUM_SEGMENTS,
-        alpha_ewma=ALPHA_EWMA,
+        alpha_jitter_ewma=ALPHA_JITTER_EWMA,
+        alpha_throughput_ewma=ALPHA_THROUGHPUT_EWMA,
     )
 
     try:

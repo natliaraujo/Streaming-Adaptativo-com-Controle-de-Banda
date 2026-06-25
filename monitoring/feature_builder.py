@@ -31,7 +31,7 @@ class FeatureConfig:
 
     sequence_length: int
     server_a_id: str = "A"
-    server_b_id: str = "srv-B"
+    server_b_id: str = "B"
 
 
 class FeatureHistory:

@@ -116,10 +116,18 @@ class ThresholdBufferAwareQualitySelector:
         # Com buffer confortável, usa a reserva para experimentar um degrau acima.
         if (
             buffer_level_s >= self.target_buffer_s
+            and buffer_level_s <= self.target_buffer_s + 10
             and estimated_throughput_kbps > 0.0
             and chosen_index < len(representations) - 1
         ):
             chosen_index += 1
+            
+        if (
+            buffer_level_s >= self.target_buffer_s + 10
+            and estimated_throughput_kbps > 0.0
+            and chosen_index < len(representations) - 1
+        ):
+            chosen_index = len(representations) - 1
 
         return representations[chosen_index]
 

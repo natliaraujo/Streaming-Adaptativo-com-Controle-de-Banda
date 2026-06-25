@@ -12,6 +12,14 @@ download ou decisão de política.
 from dataclasses import dataclass
 
 
+def normalize_server_id(server_id: str) -> str:
+    """Converte aliases do manifest para os identificadores canônicos A/B."""
+    prefix, separator, suffix = server_id.partition("-")
+    if separator and prefix.casefold() == "srv" and suffix.casefold() in {"a", "b"}:
+        return suffix.upper()
+    return server_id
+
+
 @dataclass(frozen=True)
 class ServerInfo:
     """Metadados de um servidor disponível para baixar segmentos."""

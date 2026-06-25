@@ -1,6 +1,7 @@
 """Coordena políticas, downloads, buffer, failover e métricas do experimento."""
 
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
 from config import (
@@ -13,7 +14,7 @@ from config import (
     NETWORK_RETRY_DELAY_S,
 )
 from domain.action import StreamingAction
-from domain.manifest import Manifest, Representation, ServerInfo
+from domain.manifest import Manifest, Representation, ServerInfo, normalize_server_id
 from domain.metrics import SegmentMetrics
 from experiment.csv_writer import CsvMetricsWriter
 from monitoring.observation_store import ObservationStore, ServerObservation
@@ -21,6 +22,14 @@ from network.segment_downloader import DownloadResult, download_segment
 from network.server_probe import probe_server_health
 from player.buffer import BufferManager
 from policy.streaming_policy import StreamingPolicy
+
+
+ServerFailurePredicate = Callable[[int, ServerInfo], bool]
+
+
+def display_server_id(server_id: str) -> str:
+    """Padroniza identificadores de servidor usados em logs e CSVs."""
+    return normalize_server_id(server_id)
 
 
 def estimate_download_time_s(
@@ -52,8 +61,10 @@ class ExperimentRunner:
         policy: StreamingPolicy,
         csv_writer: CsvMetricsWriter,
         num_segments: int,
-        alpha_ewma: float,
+        alpha_jitter_ewma: float,
+        alpha_throughput_ewma: float,
         observation_store: ObservationStore | None = None,
+        simulated_server_failure: ServerFailurePredicate | None = None,
     ) -> None:
         """Prepara o estado compartilhado de uma execução.
 
@@ -66,15 +77,22 @@ class ExperimentRunner:
             policy: Estratégia que escolhe servidor e representação.
             csv_writer: Destino das métricas produzidas.
             num_segments: Quantidade de segmentos do experimento.
-            alpha_ewma: Peso da amostra mais recente nas EWMAs.
+            alpha_jitter_ewma: Peso da amostra mais recente no jitter_ewma.
+            alpha_throughput_ewma: Peso da amostra mais recente no throughput_ewma.
             observation_store: Snapshot opcional dos monitores de servidor.
+            simulated_server_failure: Predicado opcional que marca um servidor
+                como indisponível em um segmento. É usado somente por
+                experimentos controlados de failover.
         """
         self.manifest: Manifest = manifest
         self.policy: StreamingPolicy = policy
         self.csv_writer: CsvMetricsWriter = csv_writer
         self.num_segments: int = num_segments
-        self.alpha_ewma: float = alpha_ewma
+        self.alpha_jitter_ewma: float = alpha_jitter_ewma
+        self.alpha_throughput_ewma: float = alpha_throughput_ewma
         self.observation_store: ObservationStore | None = observation_store
+        self.simulated_server_failure = simulated_server_failure
+        self.current_segment: int = 0
 
         self.buffer = BufferManager(
             max_level_s=BUFFER_MAX_S,
@@ -116,6 +134,7 @@ class ExperimentRunner:
         Args:
             seg_num: Número sequencial do segmento, iniciado em um.
         """
+        self.current_segment = seg_num
         observations: dict[str, ServerObservation] = self._get_observations()
         self._refresh_failed_servers()
 
@@ -196,7 +215,7 @@ class ExperimentRunner:
 
         print(
             f"Seg {seg_num:3d}: {chosen_rep.quality:5s} "
-            f"Servidor={server.id:5s} "
+            f"Servidor={display_server_id(server.id):5s} "
             f"Vazão={result.throughput_kbps:7.1f} kbps "
             f"EWMA={self.throughput_ewma_kbps:7.1f} kbps "
             f"Buffer={self.buffer.level_s:5.2f}s "
@@ -242,6 +261,11 @@ class ExperimentRunner:
 
         while True:
             try:
+                if self._is_simulated_failure(server):
+                    raise ConnectionError(
+                        "falha simulada do servidor "
+                        f"{server.id} no segmento {seg_num}"
+                    )
                 result = download_segment(
                     server_url=server.url,
                     path=path,
@@ -260,7 +284,7 @@ class ExperimentRunner:
             except Exception as exc:
                 print(
                     f"Erro no segmento {seg_num} usando servidor "
-                    f"{server.id}: {exc}"
+                    f"{display_server_id(server.id)}: {exc}"
                 )
                 self.failed_server_ids.add(server.id)
 
@@ -295,13 +319,13 @@ class ExperimentRunner:
             self.throughput_ewma_kbps = result.throughput_kbps
         else:
             self.throughput_ewma_kbps = (
-                self.alpha_ewma * result.throughput_kbps
-                + (1.0 - self.alpha_ewma) * self.throughput_ewma_kbps
+                self.alpha_throughput_ewma * result.throughput_kbps
+                + (1.0 - self.alpha_throughput_ewma) * self.throughput_ewma_kbps
             )
 
         self.jitter_ewma_ms = (
-            self.alpha_ewma * result.jitter_network_ms
-            + (1.0 - self.alpha_ewma) * self.jitter_ewma_ms
+            self.alpha_jitter_ewma * result.jitter_network_ms
+            + (1.0 - self.alpha_jitter_ewma) * self.jitter_ewma_ms
         )
 
     def _refresh_failed_servers(self) -> None:
@@ -312,6 +336,8 @@ class ExperimentRunner:
         """
         for server in self.manifest.servers:
             if server.id not in self.failed_server_ids:
+                continue
+            if self._is_simulated_failure(server):
                 continue
             if probe_server_health(
                 server,
@@ -387,6 +413,8 @@ class ExperimentRunner:
         for candidate in candidates:
             if candidate.id == failed_server_id:
                 continue
+            if self._is_simulated_failure(candidate):
+                continue
             if probe_server_health(
                 candidate,
                 timeout_s=HEALTH_CHECK_TIMEOUT_S,
@@ -394,6 +422,24 @@ class ExperimentRunner:
                 self.failed_server_ids.discard(candidate.id)
                 return candidate
         return None
+
+    def _is_simulated_failure(self, server: ServerInfo) -> bool:
+        """Indica se o experimento tornou um servidor indisponível.
+
+        O predicado é consultado tanto antes do download quanto nos fluxos de
+        recuperação. Assim, um servidor que caiu não reaparece apenas porque o
+        endpoint real continua saudável durante a simulação.
+
+        Args:
+            server: Servidor cuja disponibilidade deve ser consultada.
+
+        Returns:
+            ``True`` somente quando há um injetor configurado e ele marca o
+            servidor como falho no segmento atual.
+        """
+        if self.simulated_server_failure is None:
+            return False
+        return self.simulated_server_failure(self.current_segment, server)
 
     def _get_observations(self) -> dict[str, ServerObservation]:
         """Obtém um snapshot consistente das observações de monitoramento.
@@ -463,7 +509,7 @@ class ExperimentRunner:
         return SegmentMetrics(
             segment=seg_num,
             timestamp=timestamp,
-            server_id=server.id,
+            server_id=display_server_id(server.id),
             quality=representation.quality,
             bitrate_kbps=representation.bitrate_kbps,
             throughput_kbps=result.throughput_kbps,

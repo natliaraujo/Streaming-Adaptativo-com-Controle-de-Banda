@@ -28,6 +28,8 @@ dist/
 # Generated experiment outputs
 outputs/*.csv
 outputs/plots/*.png
+outputs/figures/*.png
+outputs/.matplotlib/
 
 # Wireshark captures
 *.pcap

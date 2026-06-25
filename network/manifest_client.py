@@ -15,7 +15,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from domain.manifest import Manifest, ServerInfo, Representation
+from domain.manifest import Manifest, ServerInfo, Representation, normalize_server_id
 from config import HTTP_TIMEOUT_S, NETWORK_RETRY_DELAY_S
 
 
@@ -40,7 +40,7 @@ def parse_manifest(data: dict[str, Any]) -> Manifest:
     try:
         servers = [
             ServerInfo(
-                id=str(server["id"]),
+                id=normalize_server_id(str(server["id"])),
                 url=str(server["url"]),
                 priority=int(server["priority"]),
                 bandwidth_kbps=(

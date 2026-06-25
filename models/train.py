@@ -11,7 +11,7 @@ Exemplo de uso:
         --csv outputs/metricas_policy3_rnn.csv \
         --output outputs/models/rnn_policy.pt \
         --server-a A \
-        --server-b srv-B
+        --server-b B
 """
 
 import argparse
@@ -92,7 +92,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument(
         "--server-b",
         type=str,
-        default="srv-B",
+        default="B",
         help="Identificador do servidor B no manifest/CSV.",
     )
 

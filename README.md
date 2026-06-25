@@ -42,7 +42,7 @@ Instalação sugerida:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python3 -m pip install matplotlib torch
+python3 -m pip install -r requirements.txt
 ```
 
 No Windows PowerShell:
@@ -50,7 +50,7 @@ No Windows PowerShell:
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install matplotlib torch
+python -m pip install -r requirements.txt
 ```
 
 ## Configuração
@@ -98,6 +98,34 @@ Para gerar o gráfico de vazão e qualidade:
 
 ```bash
 python3 scripts/plot_baseline.py
+```
+
+Para gerar os gráficos individuais e as quatro comparações finais:
+
+```bash
+python scripts/generate_final_plots.py
+```
+
+Os CSVs esperados são `outputs/metricas_policy1.csv`,
+`outputs/metricas_policy2.csv` e `outputs/metricas_policy3_rnn.csv`. As figuras
+são salvas em `outputs/figures/`.
+
+Para executar e plotar o experimento controlado de failover da Política 2:
+
+```bash
+python scripts/run_policy2_failover_experiment.py
+python scripts/plot_policy2_failover_experiment.py
+```
+
+Por padrão, o servidor `A` fica indisponível apenas dos segmentos 9 a 12. A
+tentativa do segmento 9 aciona o fallback e registra `failover_event = 1` no
+CSV; a partir do segmento 13, o runner revalida o `/health` de `A` e pode voltar
+ao servidor principal.
+
+Também é possível ajustar a janela de falha:
+
+```bash
+python scripts/run_policy2_failover_experiment.py --fail-after-segment 8 --fail-duration-segments 4
 ```
 
 Por padrão, o gráfico é salvo em:

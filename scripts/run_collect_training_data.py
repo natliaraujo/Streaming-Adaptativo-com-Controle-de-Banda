@@ -11,7 +11,7 @@ O CSV gerado por este script deve ser usado como entrada do treinamento:
         --csv outputs/rnn_training_data.csv \
         --output outputs/models/rnn_policy.pt \
         --server-a A \
-        --server-b srv-B
+        --server-b B
 """
 
 import sys
@@ -25,7 +25,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from config import (  # noqa: E402
     ABR_HISTORY_SIZE,
-    ALPHA_EWMA,
+    ALPHA_JITTER_EWMA,
+    ALPHA_THROUGHPUT_EWMA,
     MANIFEST_URL,
     TRAINING_FAULT_MAX_DURATION_S,
     TRAINING_FAULT_MAX_GAP_S,
@@ -126,7 +127,8 @@ def main() -> None:
         observation_store=observation_store,
         csv_writer=csv_writer,
         num_segments=TRAINING_NUM_SEGMENTS,
-        alpha_ewma=ALPHA_EWMA,
+        alpha_jitter_ewma=ALPHA_JITTER_EWMA,
+        alpha_throughput_ewma=ALPHA_THROUGHPUT_EWMA,
     )
 
     try:

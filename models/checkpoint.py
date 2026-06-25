@@ -12,6 +12,7 @@ from typing import Any
 
 import torch
 
+from domain.manifest import normalize_server_id
 from models.dataset import FeatureNormalizer
 from models.rnn import StreamingRNN
 
@@ -88,6 +89,6 @@ def load_rnn_checkpoint(checkpoint_path: Path) -> LoadedRnnModel:
         sequence_length=int(checkpoint["sequence_length"]),
         feature_size=feature_size,
         hidden_size=hidden_size,
-        server_a_id=str(checkpoint["server_a_id"]),
-        server_b_id=str(checkpoint["server_b_id"]),
+        server_a_id=normalize_server_id(str(checkpoint["server_a_id"])),
+        server_b_id=normalize_server_id(str(checkpoint["server_b_id"])),
     )

@@ -19,7 +19,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from config import (  # noqa: E402
     ABR_HISTORY_SIZE,
-    ALPHA_EWMA,
+    ALPHA_JITTER_EWMA,
+    ALPHA_THROUGHPUT_EWMA,
     MANIFEST_URL,
     NUM_SEGMENTS,
     SAFETY_FACTOR,
@@ -53,7 +54,8 @@ def main() -> None:
         policy=policy,
         csv_writer=csv_writer,
         num_segments=NUM_SEGMENTS,
-        alpha_ewma=ALPHA_EWMA,
+        alpha_jitter_ewma=ALPHA_JITTER_EWMA,
+        alpha_throughput_ewma=ALPHA_THROUGHPUT_EWMA,
     )
 
     runner.run()
