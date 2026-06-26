@@ -1,6 +1,23 @@
-"""Modelos imutáveis que representam o manifesto do serviço de streaming."""
+"""
+Define as estruturas de dados que representam o Manifest v2.0 do sistema.
+
+O manifest descreve os servidores disponíveis, suas prioridades e parâmetros
+de rede declarados, além das representações de qualidade disponíveis para os
+segmentos de vídeo.
+
+Este módulo contém apenas modelos de domínio imutáveis, sem lógica de rede,
+download ou decisão de política.
+"""
 
 from dataclasses import dataclass
+
+
+def normalize_server_id(server_id: str) -> str:
+    """Converte aliases do manifest para os identificadores canônicos A/B."""
+    prefix, separator, suffix = server_id.partition("-")
+    if separator and prefix.casefold() == "srv" and suffix.casefold() in {"a", "b"}:
+        return suffix.upper()
+    return server_id
 
 
 @dataclass(frozen=True)
