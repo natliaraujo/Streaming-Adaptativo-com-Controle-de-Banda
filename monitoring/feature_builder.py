@@ -23,6 +23,7 @@ class PlayerState:
     last_download_time_s: float
     last_rebuffer_event: int
     last_server_index: int
+    startup_phase: int
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,7 @@ class FeatureConfig:
     sequence_length: int
     server_a_id: str = "A"
     server_b_id: str = "B"
+    startup_segments: int = 10
 
 
 class FeatureHistory:
@@ -131,7 +133,7 @@ def build_feature_vector(
         config: Configuração dos identificadores dos servidores.
 
     Returns:
-        Vetor de features com tamanho 15.
+        Vetor de features com tamanho 16.
     """
     obs_a: ServerObservation | None = observations.get(config.server_a_id)
     obs_b: ServerObservation | None = observations.get(config.server_b_id)
@@ -172,4 +174,5 @@ def build_feature_vector(
         player_state.last_download_time_s,
         float(player_state.last_rebuffer_event),
         float(player_state.last_server_index),
+        float(player_state.startup_phase),
     ]

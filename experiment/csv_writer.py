@@ -6,6 +6,7 @@ tabulares usadas na análise e no treinamento da RNN.
 """
 
 import csv
+from pathlib import Path
 from typing import TextIO
 
 from domain.metrics import SegmentMetrics
@@ -17,6 +18,7 @@ class CsvMetricsWriter:
     HEADER: list[str] = [
         "segment",
         "timestamp",
+        "startup_phase",
         "server_id",
         "quality",
         "bitrate_kbps",
@@ -33,6 +35,9 @@ class CsvMetricsWriter:
         "failover_event",
         "failover_duration_s",
         "failover_total",
+        "rnn_predicted_a_throughput_kbps",
+        "rnn_predicted_b_throughput_kbps",
+        "rnn_predicted_selected_throughput_kbps",
         "probe_a_ok",
         "probe_a_latency_ms",
         "probe_a_throughput_kbps",
@@ -43,16 +48,42 @@ class CsvMetricsWriter:
         "probe_b_jitter_ms",
     ]
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, append: bool = False) -> None:
         """
-        Abre o arquivo CSV e escreve o cabeçalho.
+        Abre o arquivo CSV e escreve ou reaproveita o cabeçalho.
 
         Args:
             path: Caminho do arquivo CSV.
+            append: Quando ``True``, adiciona linhas ao fim de um CSV existente.
+                O cabeçalho existente precisa ser igual ao esquema atual.
         """
-        self.file: TextIO = open(path, "w", newline="", encoding="utf-8")
+        csv_path = Path(path)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.header: list[str] = list(self.HEADER)
+        should_write_header = True
+        mode = "w"
+        if append and csv_path.exists() and csv_path.stat().st_size > 0:
+            existing_header = self._read_existing_header(csv_path)
+            unknown_columns = [
+                column
+                for column in existing_header
+                if column not in self.HEADER
+            ]
+            if unknown_columns:
+                raise ValueError(
+                    f"CSV existente com cabeçalho incompatível: {csv_path}. "
+                    "Colunas desconhecidas: "
+                    + ", ".join(unknown_columns)
+                )
+            self.header = existing_header
+            should_write_header = False
+            mode = "a"
+
+        self.file: TextIO = open(csv_path, mode, newline="", encoding="utf-8")
         self.writer = csv.writer(self.file)
-        self.writer.writerow(self.HEADER)
+        if should_write_header:
+            self.writer.writerow(self.header)
 
     def write(self, metrics: SegmentMetrics) -> None:
         """
@@ -61,36 +92,8 @@ class CsvMetricsWriter:
         Args:
             metrics: Métricas do segmento.
         """
-        self.writer.writerow(
-            [
-                metrics.segment,
-                metrics.timestamp,
-                metrics.server_id,
-                metrics.quality,
-                metrics.bitrate_kbps,
-                round(metrics.throughput_kbps, 2),
-                self._format_optional_float(metrics.throughput_ewma_kbps),
-                round(metrics.download_time_s, 3),
-                round(metrics.jitter_network_ms, 2),
-                round(metrics.jitter_ewma_ms, 2),
-                round(metrics.buffer_level_s, 2),
-                metrics.buffer_can_play,
-                metrics.rebuffer_event,
-                round(metrics.stall_duration_s, 3),
-                round(metrics.playback_wait_s, 3),
-                metrics.failover_event,
-                round(metrics.failover_duration_s, 3),
-                metrics.failover_total,
-                self._format_optional_int(metrics.probe_a_ok),
-                self._format_optional_float(metrics.probe_a_latency_ms),
-                self._format_optional_float(metrics.probe_a_throughput_kbps),
-                self._format_optional_float(metrics.probe_a_jitter_ms),
-                self._format_optional_int(metrics.probe_b_ok),
-                self._format_optional_float(metrics.probe_b_latency_ms),
-                self._format_optional_float(metrics.probe_b_throughput_kbps),
-                self._format_optional_float(metrics.probe_b_jitter_ms),
-            ]
-        )
+        row = self._row_from_metrics(metrics)
+        self.writer.writerow([row.get(column, "") for column in self.header])
         self.file.flush()
 
     def close(self) -> None:
@@ -128,3 +131,64 @@ class CsvMetricsWriter:
             return ""
 
         return str(value)
+
+    def _read_existing_header(self, path: Path) -> list[str]:
+        """Lê o cabeçalho de um CSV existente."""
+        with path.open(newline="", encoding="utf-8") as csv_file:
+            reader = csv.reader(csv_file)
+            return next(reader, [])
+
+    def _row_from_metrics(self, metrics: SegmentMetrics) -> dict[str, object]:
+        """Converte métricas para um dicionário indexado pelo cabeçalho atual."""
+        return {
+            "segment": metrics.segment,
+            "timestamp": metrics.timestamp,
+            "startup_phase": metrics.startup_phase,
+            "server_id": metrics.server_id,
+            "quality": metrics.quality,
+            "bitrate_kbps": metrics.bitrate_kbps,
+            "throughput_kbps": round(metrics.throughput_kbps, 2),
+            "throughput_ewma_kbps": self._format_optional_float(
+                metrics.throughput_ewma_kbps
+            ),
+            "download_time_s": round(metrics.download_time_s, 3),
+            "jitter_network_ms": round(metrics.jitter_network_ms, 2),
+            "jitter_ewma_ms": round(metrics.jitter_ewma_ms, 2),
+            "buffer_level_s": round(metrics.buffer_level_s, 2),
+            "buffer_can_play": metrics.buffer_can_play,
+            "rebuffer_event": metrics.rebuffer_event,
+            "stall_duration_s": round(metrics.stall_duration_s, 3),
+            "playback_wait_s": round(metrics.playback_wait_s, 3),
+            "failover_event": metrics.failover_event,
+            "failover_duration_s": round(metrics.failover_duration_s, 3),
+            "failover_total": metrics.failover_total,
+            "rnn_predicted_a_throughput_kbps": self._format_optional_float(
+                metrics.rnn_predicted_a_throughput_kbps
+            ),
+            "rnn_predicted_b_throughput_kbps": self._format_optional_float(
+                metrics.rnn_predicted_b_throughput_kbps
+            ),
+            "rnn_predicted_selected_throughput_kbps": self._format_optional_float(
+                metrics.rnn_predicted_selected_throughput_kbps
+            ),
+            "probe_a_ok": self._format_optional_int(metrics.probe_a_ok),
+            "probe_a_latency_ms": self._format_optional_float(
+                metrics.probe_a_latency_ms
+            ),
+            "probe_a_throughput_kbps": self._format_optional_float(
+                metrics.probe_a_throughput_kbps
+            ),
+            "probe_a_jitter_ms": self._format_optional_float(
+                metrics.probe_a_jitter_ms
+            ),
+            "probe_b_ok": self._format_optional_int(metrics.probe_b_ok),
+            "probe_b_latency_ms": self._format_optional_float(
+                metrics.probe_b_latency_ms
+            ),
+            "probe_b_throughput_kbps": self._format_optional_float(
+                metrics.probe_b_throughput_kbps
+            ),
+            "probe_b_jitter_ms": self._format_optional_float(
+                metrics.probe_b_jitter_ms
+            ),
+        }

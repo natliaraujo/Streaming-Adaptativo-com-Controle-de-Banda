@@ -57,6 +57,7 @@ class RnnStreamingPolicy(StreamingPolicy):
         self.last_download_time_s: float = 0.0
         self.last_rebuffer_event: int = 0
         self.last_server_index: int = 0
+        self.decision_count: int = 0
 
     def update_last_download_state(
         self,
@@ -106,6 +107,9 @@ class RnnStreamingPolicy(StreamingPolicy):
             last_download_time_s=self.last_download_time_s,
             last_rebuffer_event=self.last_rebuffer_event,
             last_server_index=self.last_server_index,
+            startup_phase=int(
+                self.decision_count < self.feature_config.startup_segments
+            ),
         )
 
         feature_vector: list[float] = build_feature_vector(
@@ -115,6 +119,7 @@ class RnnStreamingPolicy(StreamingPolicy):
         )
 
         self.feature_history.append(feature_vector)
+        self.decision_count += 1
 
         if not self.feature_history.is_ready():
             return self._fallback_action(
@@ -161,6 +166,9 @@ class RnnStreamingPolicy(StreamingPolicy):
         return StreamingAction(
             server=server,
             representation=representation,
+            predicted_server_a_throughput_kbps=predicted_a,
+            predicted_server_b_throughput_kbps=predicted_b,
+            predicted_selected_throughput_kbps=predicted_throughput_kbps,
         )
 
     def _fallback_action(

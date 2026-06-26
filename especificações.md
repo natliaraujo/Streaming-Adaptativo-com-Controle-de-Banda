@@ -233,6 +233,7 @@ http://137.131.178.229:8080/manifest
 |---|---|
 | segment | Número do segmento |
 | timestamp | Horário |
+| startup_phase | Fase inicial da execução |
 | server_id | Servidor |
 | quality | Qualidade |
 | bitrate_kbps | Bitrate |
@@ -241,6 +242,9 @@ http://137.131.178.229:8080/manifest
 | buffer_level_s | Buffer |
 | rebuffer_event | Rebuffer |
 | failover_total | Total de failovers |
+| rnn_predicted_a_throughput_kbps | Vazão prevista pela RNN para o servidor A |
+| rnn_predicted_b_throughput_kbps | Vazão prevista pela RNN para o servidor B |
+| rnn_predicted_selected_throughput_kbps | Previsão usada na decisão da RNN |
 
 ---
 

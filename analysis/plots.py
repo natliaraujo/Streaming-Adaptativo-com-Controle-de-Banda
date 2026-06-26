@@ -35,6 +35,48 @@ class SegmentMetric:
     rebuffer_event: int
 
 
+def quality_levels(metrics: list[SegmentMetric]) -> list[tuple[float, str]]:
+    """Retorna níveis únicos de qualidade ordenados por bitrate."""
+    by_bitrate: dict[float, str] = {}
+    for metric in metrics:
+        by_bitrate.setdefault(metric.bitrate_kbps, metric.quality)
+    return sorted(by_bitrate.items())
+
+
+def set_quality_ticks(axis, metrics: list[SegmentMetric]) -> None:
+    """Mostra as representações no eixo, sem rótulos repetidos na série."""
+    levels = quality_levels(metrics)
+    if not levels:
+        return
+    axis.set_yticks([bitrate for bitrate, _quality in levels])
+    axis.set_yticklabels(
+        [
+            f"{quality}\n{bitrate:g} kbps"
+            for bitrate, quality in levels
+        ],
+        fontsize=8,
+    )
+
+
+def markevery(total_points: int, target_markers: int = 28) -> int:
+    """Espaça marcadores em séries longas."""
+    return max(1, total_points // target_markers)
+
+
+def dedup_legend(handles, labels):
+    """Remove entradas repetidas de legenda preservando a ordem."""
+    seen: set[str] = set()
+    unique_handles = []
+    unique_labels = []
+    for handle, label in zip(handles, labels, strict=True):
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        unique_handles.append(handle)
+        unique_labels.append(label)
+    return unique_handles, unique_labels
+
+
 def choose_throughput_column(fieldnames: list[str]) -> str:
     """
     Seleciona a coluna do CSV que contém a vazão medida.
@@ -129,6 +171,7 @@ def plot_throughput_and_quality(
 
     try:
         import matplotlib.pyplot as plt
+        from matplotlib.ticker import MaxNLocator
     except ModuleNotFoundError as exc:
         raise SystemExit(
             "Dependencia ausente: instale matplotlib para gerar os graficos "
@@ -142,43 +185,47 @@ def plot_throughput_and_quality(
     bitrates = [metric.bitrate_kbps for metric in metrics]
 
     fig, ax = plt.subplots(figsize=(11, 6))
+    bitrate_axis = ax.twinx()
 
     ax.plot(
         segments,
         throughputs,
         marker="o",
-        linewidth=2,
+        markersize=3,
+        markevery=markevery(len(segments)),
+        linewidth=1.8,
         label="Vazao medida",
     )
 
-    ax.step(
+    bitrate_axis.step(
         segments,
         bitrates,
         where="mid",
         linewidth=2,
-        label="Qualidade escolhida",
+        color="#d97706",
+        label="Bitrate selecionado",
     )
-
-    ax.scatter(segments, bitrates, s=32, zorder=3)
-
-    for metric in metrics:
-        ax.annotate(
-            metric.quality,
-            (metric.segment, metric.bitrate_kbps),
-            textcoords="offset points",
-            xytext=(0, 8),
-            ha="center",
-            fontsize=9,
-        )
+    set_quality_ticks(bitrate_axis, metrics)
 
     ax.set_title("Vazao e qualidade por segmento")
     ax.set_xlabel("Segmento")
-    ax.set_ylabel("kbps")
-    ax.set_xticks(segments)
+    ax.set_ylabel("Vazao medida (kbps)")
+    bitrate_axis.set_ylabel("Representacao selecionada")
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=12))
     ax.grid(True, axis="y", linestyle="--", alpha=0.35)
-    ax.legend()
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = bitrate_axis.get_legend_handles_labels()
+    handles, labels = dedup_legend(lines1 + lines2, labels1 + labels2)
+    fig.legend(
+        handles,
+        labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.01),
+        ncol=2,
+        frameon=False,
+    )
 
-    fig.tight_layout()
+    fig.tight_layout(rect=(0.0, 0.10, 1.0, 1.0))
     fig.savefig(output_path, dpi=160)
     plt.close(fig)
 
@@ -224,6 +271,7 @@ def generate_policy_comparison_plot(
     """
     try:
         import matplotlib.pyplot as plt
+        from matplotlib.ticker import MaxNLocator
     except ModuleNotFoundError as exc:
         raise SystemExit(
             "Dependência ausente: instale matplotlib para gerar os gráficos."
@@ -256,6 +304,7 @@ def generate_policy_comparison_plot(
             linewidth=1.8,
             marker="o",
             markersize=3,
+            markevery=markevery(len(segments)),
             label=label,
             color=color,
         )
@@ -286,18 +335,34 @@ def generate_policy_comparison_plot(
                 )
 
     axes[0].set_title("Qualidade selecionada")
-    axes[0].set_ylabel("Bitrate (kbps)")
+    axes[0].set_ylabel("Representação")
     axes[1].set_title("Vazão medida")
     axes[1].set_ylabel("Throughput (kbps)")
     axes[2].set_title("Nível do buffer")
     axes[2].set_ylabel("Buffer (s)")
     axes[2].set_xlabel("Segmento")
+    all_metrics = [
+        metric
+        for _label, metrics, _color in datasets
+        for metric in metrics
+    ]
+    set_quality_ticks(axes[0], all_metrics)
 
     for axis in axes:
         axis.grid(True, axis="y", linestyle="--", alpha=0.3)
-        axis.legend()
+        axis.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=12))
 
-    fig.tight_layout()
+    handles, labels = axes[0].get_legend_handles_labels()
+    handles, labels = dedup_legend(handles, labels)
+    fig.legend(
+        handles,
+        labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.01),
+        ncol=min(3, len(labels)),
+        frameon=False,
+    )
+    fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
     fig.savefig(output_path, dpi=160)
     plt.close(fig)
 
@@ -323,6 +388,7 @@ def generate_quality_buffer_comparison_plot(
     """
     try:
         import matplotlib.pyplot as plt
+        from matplotlib.ticker import MaxNLocator
     except ModuleNotFoundError as exc:
         raise SystemExit(
             "Dependência ausente: instale matplotlib para gerar os gráficos."
@@ -385,22 +451,30 @@ def generate_quality_buffer_comparison_plot(
         )
 
         quality_axis.set_title(label)
-        quality_axis.set_ylabel("Bitrate (kbps)")
+        quality_axis.set_ylabel("Representação")
+        set_quality_ticks(quality_axis, metrics)
         quality_axis.grid(True, axis="y", linestyle="--", alpha=0.25)
+        quality_axis.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=12))
         buffer_axis.set_ylabel("Buffer (s)")
         buffer_axis.set_ylim(0.0, BUFFER_MAX_S + 1.0)
 
-        quality_lines, quality_labels = quality_axis.get_legend_handles_labels()
-        buffer_lines, buffer_labels = buffer_axis.get_legend_handles_labels()
-        quality_axis.legend(
-            quality_lines + buffer_lines,
-            quality_labels + buffer_labels,
-            loc="lower right",
-            ncol=2,
-        )
-
     axes[-1][0].set_xlabel("Segmento")
+    legend_handles = []
+    legend_labels = []
+    for axis in fig.axes:
+        axis_handles, axis_labels = axis.get_legend_handles_labels()
+        legend_handles.extend(axis_handles)
+        legend_labels.extend(axis_labels)
+    legend_handles, legend_labels = dedup_legend(legend_handles, legend_labels)
+    fig.legend(
+        legend_handles,
+        legend_labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.01),
+        ncol=min(4, len(legend_labels)),
+        frameon=False,
+    )
     fig.suptitle("Qualidade escolhida e buffer por política", fontsize=16)
-    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    fig.tight_layout(rect=(0, 0.06, 1, 0.98))
     fig.savefig(output_path, dpi=160)
     plt.close(fig)

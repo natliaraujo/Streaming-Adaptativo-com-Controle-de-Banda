@@ -12,6 +12,7 @@ from config import (
     HEALTH_CHECK_TIMEOUT_S,
     NETWORK_RECOVERY_MAX_WAIT_S,
     NETWORK_RETRY_DELAY_S,
+    RNN_STARTUP_SEGMENTS,
 )
 from domain.action import StreamingAction
 from domain.manifest import Manifest, Representation, ServerInfo, normalize_server_id
@@ -200,6 +201,7 @@ class ExperimentRunner:
         metrics = self._build_metrics(
             seg_num=seg_num,
             timestamp=timestamp,
+            action=action,
             server=server,
             representation=chosen_rep,
             result=result,
@@ -473,6 +475,7 @@ class ExperimentRunner:
         self,
         seg_num: int,
         timestamp: str,
+        action: StreamingAction,
         server: ServerInfo,
         representation: Representation,
         result: DownloadResult,
@@ -489,6 +492,7 @@ class ExperimentRunner:
         Args:
             seg_num: Número sequencial do segmento.
             timestamp: Horário ISO 8601 do início da operação.
+            action: Decisão original da política, incluindo previsões opcionais.
             server: Servidor que concluiu o download.
             representation: Qualidade escolhida para o segmento.
             result: Medições do download bem-sucedido.
@@ -509,6 +513,7 @@ class ExperimentRunner:
         return SegmentMetrics(
             segment=seg_num,
             timestamp=timestamp,
+            startup_phase=int(seg_num <= RNN_STARTUP_SEGMENTS),
             server_id=display_server_id(server.id),
             quality=representation.quality,
             bitrate_kbps=representation.bitrate_kbps,
@@ -525,6 +530,15 @@ class ExperimentRunner:
             failover_event=failover_event,
             failover_duration_s=failover_duration_s,
             failover_total=self.failover_total,
+            rnn_predicted_a_throughput_kbps=(
+                action.predicted_server_a_throughput_kbps
+            ),
+            rnn_predicted_b_throughput_kbps=(
+                action.predicted_server_b_throughput_kbps
+            ),
+            rnn_predicted_selected_throughput_kbps=(
+                action.predicted_selected_throughput_kbps
+            ),
             probe_a_ok=None if obs_a is None else int(obs_a.success),
             probe_a_latency_ms=None if obs_a is None else obs_a.latency_ms,
             probe_a_throughput_kbps=None if obs_a is None else obs_a.throughput_kbps,

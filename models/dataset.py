@@ -276,6 +276,7 @@ def row_to_feature_vector(
     row: dict[str, str],
     server_a_id: str,
     server_b_id: str,
+    startup_segments: int,
 ) -> list[float]:
     """
     Converte uma linha do CSV em vetor de features.
@@ -289,7 +290,7 @@ def row_to_feature_vector(
         server_b_id: Identificador do servidor B.
 
     Returns:
-        Vetor de features com tamanho 15.
+        Vetor de features com tamanho 16.
     """
     throughput_a: float = get_float(row, "probe_a_throughput_kbps")
     latency_a: float = get_float(row, "probe_a_latency_ms")
@@ -316,6 +317,11 @@ def row_to_feature_vector(
             server_b_id=server_b_id,
         )
     )
+    startup_phase: float = get_float(
+        row,
+        "startup_phase",
+        default=float(get_int(row, "segment") <= startup_segments),
+    )
 
     return [
         throughput_a,
@@ -333,6 +339,7 @@ def row_to_feature_vector(
         last_download_time_s,
         last_rebuffer_event,
         last_server_index,
+        startup_phase,
     ]
 
 
@@ -352,6 +359,46 @@ def row_to_target(row: dict[str, str]) -> list[float]:
         get_float(row, "probe_a_throughput_kbps"),
         get_float(row, "probe_b_throughput_kbps"),
     ]
+
+
+def split_rows_by_segment_runs(rows: list[dict[str, str]]) -> list[list[dict[str, str]]]:
+    """
+    Divide linhas anexadas em execuções independentes pelo reinício do segmento.
+
+    Quando `scripts/run_collect_training_data.py` adiciona novas coletas ao mesmo
+    CSV, o campo `segment` volta a começar em 1. Essa quebra impede que uma
+    janela temporal da RNN misture o fim de uma coleta com o início da próxima.
+
+    Args:
+        rows: Linhas do CSV na ordem original.
+
+    Returns:
+        Lista de execuções contíguas.
+    """
+    if not rows or "segment" not in rows[0]:
+        return [rows]
+
+    runs: list[list[dict[str, str]]] = []
+    current_run: list[dict[str, str]] = []
+    previous_segment: int | None = None
+
+    for row in rows:
+        segment = get_int(row, "segment")
+        if (
+            previous_segment is not None
+            and current_run
+            and segment <= previous_segment
+        ):
+            runs.append(current_run)
+            current_run = []
+
+        current_run.append(row)
+        previous_segment = segment
+
+    if current_run:
+        runs.append(current_run)
+
+    return runs
 
 
 def build_samples_from_rows(
@@ -378,7 +425,8 @@ def build_samples_from_rows(
     Raises:
         ValueError: Se não houver linhas suficientes.
     """
-    if len(rows) <= sequence_length:
+    runs: list[list[dict[str, str]]] = split_rows_by_segment_runs(rows)
+    if all(len(run_rows) <= sequence_length for run_rows in runs):
         raise ValueError(
             "CSV não possui linhas suficientes para formar sequências. "
             f"Linhas={len(rows)}, sequence_length={sequence_length}"
@@ -386,30 +434,35 @@ def build_samples_from_rows(
 
     samples: list[RnnSample] = []
 
-    feature_rows: list[list[float]] = [
-        row_to_feature_vector(
-            row=row,
-            server_a_id=server_a_id,
-            server_b_id=server_b_id,
-        )
-        for row in rows
-    ]
+    for run_rows in runs:
+        if len(run_rows) <= sequence_length:
+            continue
 
-    targets: list[list[float]] = [row_to_target(row) for row in rows]
-
-    for target_index in range(sequence_length, len(rows)):
-        start_index: int = target_index - sequence_length
-        end_index: int = target_index
-
-        x_sequence: list[list[float]] = feature_rows[start_index:end_index]
-        y_target: list[float] = targets[target_index]
-
-        samples.append(
-            RnnSample(
-                x=x_sequence,
-                y=y_target,
+        feature_rows: list[list[float]] = [
+            row_to_feature_vector(
+                row=row,
+                server_a_id=server_a_id,
+                server_b_id=server_b_id,
+                startup_segments=sequence_length,
             )
-        )
+            for row in run_rows
+        ]
+
+        targets: list[list[float]] = [row_to_target(row) for row in run_rows]
+
+        for target_index in range(sequence_length, len(run_rows)):
+            start_index: int = target_index - sequence_length
+            end_index: int = target_index
+
+            x_sequence: list[list[float]] = feature_rows[start_index:end_index]
+            y_target: list[float] = targets[target_index]
+
+            samples.append(
+                RnnSample(
+                    x=x_sequence,
+                    y=y_target,
+                )
+            )
 
     return samples
 

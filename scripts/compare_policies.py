@@ -2,36 +2,21 @@
 Gera comparações entre as políticas implementadas.
 
 Este script lê os CSVs produzidos pelas políticas 1, 2 e 3, calcula métricas
-agregadas e imprime uma tabela comparativa. Ele também pode ser usado como base
-para gerar gráficos comparativos no relatório final.
+agregadas e imprime uma tabela comparativa. A geração de gráficos fica
+centralizada em `scripts/generate_plots.py`.
 """
 
 import argparse
 import csv
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
 
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from analysis import (  # noqa: E402
-    generate_policy_comparison_plot,
-    generate_quality_buffer_comparison_plot,
-)
-
 
 DEFAULT_POLICY1_CSV: Path = PROJECT_ROOT / "outputs" / "metricas_policy1.csv"
 DEFAULT_POLICY2_CSV: Path = PROJECT_ROOT / "outputs" / "metricas_policy2.csv"
 DEFAULT_POLICY3_CSV: Path = PROJECT_ROOT / "outputs" / "metricas_policy3_rnn.csv"
-DEFAULT_PLOT_PATH: Path = (
-    PROJECT_ROOT / "outputs" / "plots" / "comparacao_policy1_policy2.png"
-)
-DEFAULT_QUALITY_BUFFER_PLOT_PATH: Path = (
-    PROJECT_ROOT / "outputs" / "plots" / "comparacao_qualidade_buffer.png"
-)
 
 
 @dataclass(frozen=True)
@@ -62,8 +47,6 @@ class CliArgs:
     """Argumentos de linha de comando do comparador."""
 
     policy_csvs: list[PolicyCsv]
-    output_path: Path
-    quality_buffer_output_path: Path
 
 
 def parse_args() -> CliArgs:
@@ -98,23 +81,6 @@ def parse_args() -> CliArgs:
         help=f"CSV da política 3. Padrão: {DEFAULT_POLICY3_CSV}",
     )
 
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=DEFAULT_PLOT_PATH,
-        help=f"PNG comparativo das três políticas. Padrão: {DEFAULT_PLOT_PATH}",
-    )
-
-    parser.add_argument(
-        "--quality-buffer-output",
-        type=Path,
-        default=DEFAULT_QUALITY_BUFFER_PLOT_PATH,
-        help=(
-            "PNG de qualidade e buffer das três políticas. "
-            f"Padrão: {DEFAULT_QUALITY_BUFFER_PLOT_PATH}"
-        ),
-    )
-
     namespace = parser.parse_args()
 
     return CliArgs(
@@ -123,8 +89,6 @@ def parse_args() -> CliArgs:
             PolicyCsv("policy2", namespace.policy2),
             PolicyCsv("policy3_rnn", namespace.policy3),
         ],
-        output_path=namespace.output,
-        quality_buffer_output_path=namespace.quality_buffer_output,
     )
 
 
@@ -342,38 +306,6 @@ def main() -> None:
         raise RuntimeError("Nenhum CSV válido foi encontrado para comparação.")
 
     print_summary_table(summaries)
-
-    policy1_path: Path = args.policy_csvs[0].path
-    policy2_path: Path = args.policy_csvs[1].path
-    policy3_path: Path = args.policy_csvs[2].path
-    if policy1_path.exists() and policy2_path.exists():
-        generate_policy_comparison_plot(
-            policy1_csv=policy1_path,
-            policy2_csv=policy2_path,
-            policy3_csv=policy3_path if policy3_path.exists() else None,
-            output_path=args.output_path,
-        )
-        print(f"Gráfico comparativo gerado em: {args.output_path}")
-
-    display_names: dict[str, str] = {
-        "policy1": "Política 1",
-        "policy2": "Política 2",
-        "policy3_rnn": "Política 3 (RNN)",
-    }
-    available_policy_csvs: list[tuple[str, Path]] = [
-        (display_names.get(policy_csv.name, policy_csv.name), policy_csv.path)
-        for policy_csv in args.policy_csvs
-        if policy_csv.path.exists()
-    ]
-    if available_policy_csvs:
-        generate_quality_buffer_comparison_plot(
-            policy_csvs=available_policy_csvs,
-            output_path=args.quality_buffer_output_path,
-        )
-        print(
-            "Gráfico de qualidade e buffer gerado em: "
-            f"{args.quality_buffer_output_path}"
-        )
 
 
 if __name__ == "__main__":

@@ -48,6 +48,9 @@ class TrainConfig:
     epochs: int
     learning_rate: float
     train_ratio: float
+    device: str
+    weight_decay: float
+    dropout: float
 
 
 @dataclass(frozen=True)
@@ -106,7 +109,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument(
         "--feature-size",
         type=int,
-        default=15,
+        default=16,
         help="Quantidade de features por timestep.",
     )
 
@@ -139,10 +142,31 @@ def parse_args() -> TrainConfig:
     )
 
     parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=1e-4,
+        help="Regularização L2/weight decay aplicada pelo AdamW.",
+    )
+
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.10,
+        help="Dropout aplicado ao estado oculto antes da camada final.",
+    )
+
+    parser.add_argument(
         "--train-ratio",
         type=float,
         default=0.8,
         help="Fração das amostras usada para treino.",
+    )
+
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cuda", "cpu"),
+        default="auto",
+        help="Dispositivo de treino. Em auto, usa GPU CUDA se disponível.",
     )
 
     args = parser.parse_args()
@@ -159,11 +183,46 @@ def parse_args() -> TrainConfig:
         epochs=args.epochs,
         learning_rate=args.lr,
         train_ratio=args.train_ratio,
+        device=args.device,
+        weight_decay=args.weight_decay,
+        dropout=args.dropout,
     )
+
+
+def select_device(requested_device: str) -> torch.device:
+    """
+    Seleciona o dispositivo de treinamento.
+
+    Args:
+        requested_device: `auto`, `cuda` ou `cpu`.
+
+    Returns:
+        Dispositivo PyTorch selecionado.
+
+    Raises:
+        RuntimeError: Se CUDA for solicitado explicitamente e não estiver
+            disponível no PyTorch instalado.
+    """
+    if requested_device == "cpu":
+        return torch.device("cpu")
+
+    if requested_device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA foi solicitada, mas não está disponível. "
+                "Instale uma build do PyTorch com CUDA ou use --device cpu."
+            )
+        return torch.device("cuda")
+
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+
+    return torch.device("cpu")
 
 
 def create_dataloaders(
     config: TrainConfig,
+    pin_memory: bool,
 ) -> tuple[
     DataLoader[tuple[torch.Tensor, torch.Tensor]],
     DataLoader[tuple[torch.Tensor, torch.Tensor]],
@@ -184,6 +243,12 @@ def create_dataloaders(
         server_a_id=config.server_a_id,
         server_b_id=config.server_b_id,
     )
+    sample_feature_size = len(samples[0].x[0])
+    if sample_feature_size != config.feature_size:
+        raise ValueError(
+            "Feature size configurado incompatível com o dataset: "
+            f"config={config.feature_size}, dataset={sample_feature_size}."
+        )
 
     train_samples, val_samples = split_samples(
         samples=samples,
@@ -206,12 +271,14 @@ def create_dataloaders(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
+        pin_memory=pin_memory,
     )
 
     val_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
+        pin_memory=pin_memory,
     )
 
     return train_loader, val_loader, normalizer
@@ -243,8 +310,9 @@ def train_one_epoch(
     total_batches: int = 0
 
     for x_batch, y_batch in loader:
-        x_batch = x_batch.to(device)
-        y_batch = y_batch.to(device)
+        use_non_blocking = device.type == "cuda"
+        x_batch = x_batch.to(device, non_blocking=use_non_blocking)
+        y_batch = y_batch.to(device, non_blocking=use_non_blocking)
 
         optimizer.zero_grad()
 
@@ -287,8 +355,9 @@ def evaluate(
 
     with torch.no_grad():
         for x_batch, y_batch in loader:
-            x_batch = x_batch.to(device)
-            y_batch = y_batch.to(device)
+            use_non_blocking = device.type == "cuda"
+            x_batch = x_batch.to(device, non_blocking=use_non_blocking)
+            y_batch = y_batch.to(device, non_blocking=use_non_blocking)
 
             prediction: torch.Tensor = model(x_batch)
             loss: torch.Tensor = loss_fn(prediction, y_batch)
@@ -323,6 +392,7 @@ def save_checkpoint(
         "sequence_length": config.sequence_length,
         "feature_size": config.feature_size,
         "hidden_size": config.hidden_size,
+        "dropout": config.dropout,
         "server_a_id": config.server_a_id,
         "server_b_id": config.server_b_id,
     }
@@ -334,26 +404,31 @@ def main() -> None:
     """Executa o treinamento da RNN."""
     config: TrainConfig = parse_args()
 
-    device: torch.device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
+    device: torch.device = select_device(config.device)
 
     print(f"Usando dispositivo: {device}")
+    if device.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Lendo dataset: {config.csv_path}")
 
-    train_loader, val_loader, normalizer = create_dataloaders(config)
+    train_loader, val_loader, normalizer = create_dataloaders(
+        config,
+        pin_memory=device.type == "cuda",
+    )
 
     model = StreamingRNN(
         input_size=config.feature_size,
         hidden_size=config.hidden_size,
         output_size=2,
+        dropout=config.dropout,
     ).to(device)
 
     loss_fn: nn.Module = nn.MSELoss()
 
-    optimizer = torch.optim.Adam(
+    optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.learning_rate,
+        weight_decay=config.weight_decay,
     )
 
     best_val_loss: float | None = None

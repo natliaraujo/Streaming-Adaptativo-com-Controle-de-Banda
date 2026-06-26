@@ -31,7 +31,7 @@ from policy import ProbeBufferAwarePolicy  # noqa: E402
 
 
 def main() -> None:
-    """Executa a política 2 baseada em probe sequencial e buffer."""
+    """Executa a política 2 baseada em EWMA e ajuste suave por buffer."""
     print("Executando política 2...")
     print("Carregando manifest...")
 

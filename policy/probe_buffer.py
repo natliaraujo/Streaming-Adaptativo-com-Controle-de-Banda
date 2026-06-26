@@ -1,11 +1,16 @@
 """Implementa a política 2 com servidor primário e seleção buffer-aware."""
 
-from config import BUFFER_MIN_S, BUFFER_TARGET_S
+from config import (
+    BUFFER_MAX_S,
+    BUFFER_TARGET_S,
+    POLICY2_BUFFER_RESPONSE_POWER,
+    POLICY2_MAX_BOOST_FACTOR,
+)
 from domain.action import StreamingAction
 from domain.manifest import Manifest, ServerInfo
 from monitoring.observation_store import ServerObservation
 from player.buffer import BufferManager
-from policy.quality_selector import ThresholdBufferAwareQualitySelector
+from policy.quality_selector import SmoothBufferAwareQualitySelector
 from policy.streaming_policy import StreamingPolicy
 
 
@@ -17,17 +22,19 @@ class ProbeBufferAwarePolicy(StreamingPolicy):
         history_size: int,
         safety_factor: float,
     ) -> None:
-        """Configura a janela de fallback e os limiares da Política 2.
+        """Configura a janela de fallback e a curva suave da Política 2.
 
         Args:
             history_size: Amostras recentes usadas se a EWMA ainda não existir.
-            safety_factor: Fração da vazão usada abaixo do buffer confortável.
+            safety_factor: Menor fração da EWMA usada com buffer baixo.
         """
         self.history_size: int = history_size
-        self.quality_selector = ThresholdBufferAwareQualitySelector(
+        self.quality_selector = SmoothBufferAwareQualitySelector(
             safety_factor=safety_factor,
-            min_buffer_s=BUFFER_MIN_S,
             target_buffer_s=BUFFER_TARGET_S,
+            max_buffer_s=BUFFER_MAX_S,
+            response_power=POLICY2_BUFFER_RESPONSE_POWER,
+            max_boost_factor=POLICY2_MAX_BOOST_FACTOR,
         )
 
     def select_action(
@@ -41,8 +48,9 @@ class ProbeBufferAwarePolicy(StreamingPolicy):
         """Escolhe servidor primário e qualidade por EWMA mais buffer.
 
         O servidor secundário nunca é escolhido diretamente por esta política;
-        somente o runner pode ativá-lo durante failover. A qualidade é mínima sob
-        buffer baixo e progressivamente mais ousada quando há reserva.
+        somente o runner pode ativá-lo durante failover. A qualidade fica mais
+        conservadora quando o buffer está abaixo do alvo e mais agressiva quando
+        há reserva, usando uma curva contínua em vez de faixas rígidas.
 
         Args:
             manifest: Manifesto com servidor primário e qualidades disponíveis.

@@ -15,7 +15,14 @@ PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from config import ALPHA_JITTER_EWMA, ALPHA_THROUGHPUT_EWMA, MANIFEST_URL, NUM_SEGMENTS, SAFETY_FACTOR  # noqa: E402
+from config import (  # noqa: E402
+    ALPHA_JITTER_EWMA,
+    ALPHA_THROUGHPUT_EWMA,
+    MANIFEST_URL,
+    NUM_SEGMENTS,
+    RNN_FEATURE_SIZE,
+    SAFETY_FACTOR,
+)
 from experiment import CsvMetricsWriter, ExperimentRunner  # noqa: E402
 from models.checkpoint import LoadedRnnModel, load_rnn_checkpoint  # noqa: E402
 from monitoring.feature_builder import FeatureConfig, FeatureHistory  # noqa: E402
@@ -38,6 +45,12 @@ def main() -> None:
     checkpoint_path: Path = PROJECT_ROOT / "outputs" / "models" / "rnn_policy.pt"
 
     loaded_model: LoadedRnnModel = load_rnn_checkpoint(checkpoint_path)
+    if loaded_model.feature_size != RNN_FEATURE_SIZE:
+        raise ValueError(
+            "Checkpoint incompatível com as features atuais: "
+            f"modelo tem {loaded_model.feature_size}, esperado {RNN_FEATURE_SIZE}. "
+            "Colete dados e treine novamente a RNN."
+        )
 
     output_dir: Path = PROJECT_ROOT / "outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -72,6 +85,7 @@ def main() -> None:
         sequence_length=loaded_model.sequence_length,
         server_a_id=loaded_model.server_a_id,
         server_b_id=loaded_model.server_b_id,
+        startup_segments=loaded_model.sequence_length,
     )
 
     feature_history = FeatureHistory(

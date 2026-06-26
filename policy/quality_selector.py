@@ -1,5 +1,7 @@
 """Seleciona representações de vídeo a partir de vazão estimada e buffer."""
 
+import math
+
 from domain import Representation
 
 
@@ -53,27 +55,36 @@ class RateBasedQualitySelector:
 
         return chosen
 
-
-class ThresholdBufferAwareQualitySelector:
-    """Seleciona qualidade por EWMA e pelos limiares globais do buffer."""
+class SmoothBufferAwareQualitySelector:
+    """Seleciona qualidade com ajuste contínuo pelo desvio do buffer."""
 
     def __init__(
         self,
         safety_factor: float,
-        min_buffer_s: float,
         target_buffer_s: float,
+        max_buffer_s: float,
+        response_power: float,
+        max_boost_factor: float,
     ) -> None:
-        """Configura os limiares usados pela Política 2.
+        """Configura a curva de agressividade da Política 2.
+
+        No alvo de buffer, a política usa a EWMA integral. Abaixo do alvo, aplica
+        uma redução suave até ``safety_factor``. Acima do alvo, aplica um boost
+        exponencial suave até ``max_boost_factor`` quando o buffer se aproxima do
+        máximo. ``response_power`` controla a curvatura da resposta.
 
         Args:
-            safety_factor: Fração da EWMA utilizável abaixo do nível confortável.
-            min_buffer_s: Nível que força a menor representação.
-            target_buffer_s: Nível a partir do qual a política pode experimentar
-                um degrau acima da taxa sustentada.
+            safety_factor: Menor fração da EWMA usada com buffer muito baixo.
+            target_buffer_s: Nível de buffer em que a política fica neutra.
+            max_buffer_s: Nível usado para normalizar o boost positivo.
+            response_power: Potência aplicada ao desvio normalizado do buffer.
+            max_boost_factor: Maior multiplicador permitido para a EWMA.
         """
         self.safety_factor: float = safety_factor
-        self.min_buffer_s: float = min_buffer_s
         self.target_buffer_s: float = target_buffer_s
+        self.max_buffer_s: float = max_buffer_s
+        self.response_power: float = response_power
+        self.max_boost_factor: float = max_boost_factor
 
     def select(
         self,
@@ -81,13 +92,12 @@ class ThresholdBufferAwareQualitySelector:
         estimated_throughput_kbps: float,
         buffer_level_s: float,
     ) -> Representation:
-        """Escolhe qualidade combinando EWMA e reserva de buffer.
+        """Escolhe qualidade por EWMA ajustada continuamente pelo buffer.
 
-        A estratégia possui três comportamentos: abaixo do mínimo força a menor
-        qualidade; entre mínimo e alvo aplica o fator de segurança; no alvo ou
-        acima dele usa a vazão integral e experimenta no máximo um degrau acima.
-        A promoção controlada transforma buffer acumulado em margem para testar
-        uma qualidade melhor sem saltos arbitrários.
+        A função transforma a distância entre ``buffer_level_s`` e
+        ``target_buffer_s`` em um fator multiplicativo. Como o fator é contínuo,
+        pequenas variações no buffer produzem pequenas variações na agressividade
+        da seleção, sem mudanças abruptas em limiares fixos.
 
         Args:
             representations: Qualidades disponíveis, ordenadas por bitrate.
@@ -95,41 +105,44 @@ class ThresholdBufferAwareQualitySelector:
             buffer_level_s: Segundos de vídeo disponíveis antes do download.
 
         Returns:
-            Representação escolhida segundo a zona atual do buffer.
+            Maior representação cujo bitrate cabe na EWMA ajustada pelo buffer.
         """
-        if buffer_level_s < self.min_buffer_s:
+        if estimated_throughput_kbps <= 0.0:
             return representations[0]
 
-        effective_safety_factor: float = (
-            1.0 if buffer_level_s >= self.target_buffer_s
-            else self.safety_factor
-        )
-        available_kbps: float = estimated_throughput_kbps * effective_safety_factor
+        buffer_factor: float = self._buffer_factor(buffer_level_s)
+        available_kbps: float = estimated_throughput_kbps * buffer_factor
 
-        chosen_index: int = 0
-        for index, representation in enumerate(representations):
+        chosen: Representation = representations[0]
+        for representation in representations:
             if representation.bitrate_kbps <= available_kbps:
-                chosen_index = index
+                chosen = representation
             else:
                 break
 
-        # Com buffer confortável, usa a reserva para experimentar um degrau acima.
-        if (
-            buffer_level_s >= self.target_buffer_s
-            and buffer_level_s <= self.target_buffer_s + 10
-            and estimated_throughput_kbps > 0.0
-            and chosen_index < len(representations) - 1
-        ):
-            chosen_index += 1
-            
-        if (
-            buffer_level_s >= self.target_buffer_s + 10
-            and estimated_throughput_kbps > 0.0
-            and chosen_index < len(representations) - 1
-        ):
-            chosen_index = len(representations) - 1
+        return chosen
 
-        return representations[chosen_index]
+    def _buffer_factor(self, buffer_level_s: float) -> float:
+        """Calcula o multiplicador suave aplicado à EWMA."""
+        if buffer_level_s >= self.target_buffer_s:
+            denominator: float = max(
+                self.max_buffer_s - self.target_buffer_s,
+                1e-9,
+            )
+            normalized_gap: float = min(
+                (buffer_level_s - self.target_buffer_s) / denominator,
+                1.0,
+            )
+            shaped_gap: float = normalized_gap ** self.response_power
+            return self.max_boost_factor ** shaped_gap
+
+        denominator = max(self.target_buffer_s, 1e-9)
+        normalized_gap = min(
+            (self.target_buffer_s - buffer_level_s) / denominator,
+            1.0,
+        )
+        shaped_gap = normalized_gap ** self.response_power
+        return math.pow(self.safety_factor, shaped_gap)
 
 
 class BufferAwareQualitySelector:

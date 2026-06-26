@@ -3,7 +3,7 @@ Define as métricas coletadas durante os experimentos.
 
 As métricas descrevem o resultado observado para cada segmento baixado,
 incluindo qualidade, servidor, vazão, jitter, buffer, rebuffering e, quando
-disponível, observações dos servidores usadas pela política RNN.
+disponível, observações dos servidores e previsões usadas pela política RNN.
 """
 
 from dataclasses import dataclass
@@ -15,6 +15,7 @@ class SegmentMetrics:
 
     segment: int
     timestamp: str
+    startup_phase: int
     server_id: str
     quality: str
     bitrate_kbps: int
@@ -31,6 +32,10 @@ class SegmentMetrics:
     failover_event: int
     failover_duration_s: float
     failover_total: int
+
+    rnn_predicted_a_throughput_kbps: float | None = None
+    rnn_predicted_b_throughput_kbps: float | None = None
+    rnn_predicted_selected_throughput_kbps: float | None = None
 
     probe_a_ok: int | None = None
     probe_a_latency_ms: float | None = None

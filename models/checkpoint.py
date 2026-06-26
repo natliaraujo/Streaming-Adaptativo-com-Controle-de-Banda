@@ -26,6 +26,7 @@ class LoadedRnnModel:
     sequence_length: int
     feature_size: int
     hidden_size: int
+    dropout: float
     server_a_id: str
     server_b_id: str
 
@@ -68,11 +69,13 @@ def load_rnn_checkpoint(checkpoint_path: Path) -> LoadedRnnModel:
 
     feature_size: int = int(checkpoint["feature_size"])
     hidden_size: int = int(checkpoint["hidden_size"])
+    dropout: float = float(checkpoint.get("dropout", 0.0))
 
     model = StreamingRNN(
         input_size=feature_size,
         hidden_size=hidden_size,
         output_size=2,
+        dropout=dropout,
     )
 
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -89,6 +92,7 @@ def load_rnn_checkpoint(checkpoint_path: Path) -> LoadedRnnModel:
         sequence_length=int(checkpoint["sequence_length"]),
         feature_size=feature_size,
         hidden_size=hidden_size,
+        dropout=dropout,
         server_a_id=normalize_server_id(str(checkpoint["server_a_id"])),
         server_b_id=normalize_server_id(str(checkpoint["server_b_id"])),
     )

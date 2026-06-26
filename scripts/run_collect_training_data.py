@@ -2,10 +2,12 @@
 Coleta dados de treinamento para a política RNN.
 
 Este script executa o cliente com monitores concorrentes dos servidores e uma
-política exploratória simples, sem RNN. Durante a execução, falhas temporárias
-são injetadas nos dois servidores em instantes aleatórios e reproduzíveis.
+política exploratória, sem RNN, que sorteia ciclos balanceados de servidores
+saudáveis e qualidades disponíveis. Durante a execução, falhas temporárias são
+injetadas nos dois servidores em instantes aleatórios e reproduzíveis.
 
-O CSV gerado por este script deve ser usado como entrada do treinamento:
+O CSV atualizado por este script deve ser usado como entrada do treinamento. Se
+o arquivo já existir, novas amostras são anexadas ao fim dele:
 
     python -m models.train \
         --csv outputs/rnn_training_data.csv \
@@ -24,10 +26,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import (  # noqa: E402
-    ABR_HISTORY_SIZE,
     ALPHA_JITTER_EWMA,
     ALPHA_THROUGHPUT_EWMA,
     MANIFEST_URL,
+    TRAINING_EXPLORATION_SEED,
     TRAINING_FAULT_MAX_DURATION_S,
     TRAINING_FAULT_MAX_GAP_S,
     TRAINING_FAULT_MIN_DURATION_S,
@@ -35,8 +37,8 @@ from config import (  # noqa: E402
     TRAINING_FAULT_INITIAL_DELAY_S,
     TRAINING_FAULT_SEED,
     TRAINING_FAULTS_PER_SERVER,
+    TRAINING_LOW_BUFFER_EXPLORE_PROBABILITY,
     TRAINING_NUM_SEGMENTS,
-    SAFETY_FACTOR,
 )
 from experiment import CsvMetricsWriter, ExperimentRunner  # noqa: E402
 from monitoring import (  # noqa: E402
@@ -115,11 +117,12 @@ def main() -> None:
     )
 
     policy = TrainingDataCollectionPolicy(
-        safety_factor=SAFETY_FACTOR,
-        history_size=ABR_HISTORY_SIZE,
+        seed=TRAINING_EXPLORATION_SEED,
+        low_buffer_explore_probability=TRAINING_LOW_BUFFER_EXPLORE_PROBABILITY,
     )
 
-    csv_writer = CsvMetricsWriter(str(csv_path))
+    appending: bool = csv_path.exists() and csv_path.stat().st_size > 0
+    csv_writer = CsvMetricsWriter(str(csv_path), append=True)
 
     runner = ExperimentRunner(
         manifest=manifest,
@@ -132,6 +135,11 @@ def main() -> None:
     )
 
     try:
+        print(
+            f"Exploração balanceada (seed={TRAINING_EXPLORATION_SEED}, "
+            "probabilidade de explorar com buffer baixo="
+            f"{TRAINING_LOW_BUFFER_EXPLORE_PROBABILITY:.2f})."
+        )
         print(f"Cronograma de falhas (seed={TRAINING_FAULT_SEED}):")
         for window in fault_windows:
             print(
@@ -139,6 +147,10 @@ def main() -> None:
                 f"{window.start_after_s:.1f}s até {window.end_after_s:.1f}s"
             )
 
+        if appending:
+            print(f"Anexando novas amostras em: {csv_path}")
+        else:
+            print(f"Criando CSV de treino em: {csv_path}")
         print("Coletando dados de treino...")
 
         runner.run()
@@ -150,7 +162,7 @@ def main() -> None:
         for monitor in monitors:
             monitor.join(timeout=2.0)
 
-    print(f"CSV de treino gerado em: {csv_path}")
+    print(f"CSV de treino atualizado em: {csv_path}")
 
 
 if __name__ == "__main__":

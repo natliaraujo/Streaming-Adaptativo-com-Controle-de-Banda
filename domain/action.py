@@ -20,8 +20,12 @@ class StreamingAction:
     Representa uma decisão completa de streaming.
 
     A ação indica qual servidor deve ser usado e qual representação de qualidade
-    deve ser baixada para o próximo segmento.
+    deve ser baixada para o próximo segmento. Políticas preditivas podem anexar
+    as previsões numéricas usadas na decisão.
     """
 
     server: ServerInfo
     representation: Representation
+    predicted_server_a_throughput_kbps: float | None = None
+    predicted_server_b_throughput_kbps: float | None = None
+    predicted_selected_throughput_kbps: float | None = None
