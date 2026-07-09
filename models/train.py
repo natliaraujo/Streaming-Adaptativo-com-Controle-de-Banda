@@ -2,8 +2,9 @@
 Treina a rede neural recorrente usada pela política 3.
 
 Este módulo lê um CSV de métricas contendo observações dos servidores, constrói
-sequências temporais, treina uma GRU para prever a vazão futura dos servidores A
-e B e salva um checkpoint com os pesos do modelo e os parâmetros de normalização.
+sequências temporais, treina uma GRU para prever os probes futuros dos
+servidores A/B e a vazão real do próximo download, e salva um checkpoint com os
+pesos do modelo e os parâmetros de normalização.
 
 Exemplo de uso:
 
@@ -20,8 +21,15 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from config import (
+    RNN_FEATURE_SIZE,
+    RNN_HIDDEN_SIZE,
+    RNN_SEQUENCE_LENGTH,
+    RNN_TARGET_SIZE,
+)
 from models.dataset import (
     FeatureNormalizer,
     RnnSample,
@@ -42,7 +50,9 @@ class TrainConfig:
     server_a_id: str
     server_b_id: str
     sequence_length: int
+    probe_target_smoothing_window: int
     feature_size: int
+    output_size: int
     hidden_size: int
     batch_size: int
     epochs: int
@@ -51,6 +61,15 @@ class TrainConfig:
     device: str
     weight_decay: float
     dropout: float
+    l1_lambda: float
+    grad_clip_norm: float
+    huber_beta: float
+    probe_loss_weight: float
+    download_loss_weight: float
+    rank_loss_weight: float
+    probe_diff_loss_weight: float
+    rank_logit_scale_kbps: float
+    rank_margin_threshold_kbps: float
 
 
 @dataclass(frozen=True)
@@ -58,6 +77,113 @@ class EpochMetrics:
     """Métricas agregadas de uma época."""
 
     loss: float
+
+
+class RnnPredictionLoss(nn.Module):
+    """Loss robusta com termo explícito de ranking entre servidores A/B."""
+
+    def __init__(
+        self,
+        normalizer: FeatureNormalizer,
+        probe_loss_weight: float,
+        download_loss_weight: float,
+        rank_loss_weight: float,
+        probe_diff_loss_weight: float,
+        huber_beta: float,
+        rank_logit_scale_kbps: float,
+        rank_margin_threshold_kbps: float,
+    ) -> None:
+        super().__init__()
+        if normalizer.target_mean is None or normalizer.target_std is None:
+            raise ValueError("Loss de ranking requer normalização dos alvos.")
+        if rank_logit_scale_kbps <= 0.0:
+            raise ValueError("rank_logit_scale_kbps deve ser positivo.")
+        if rank_margin_threshold_kbps < 0.0:
+            raise ValueError("rank_margin_threshold_kbps não pode ser negativo.")
+        if huber_beta <= 0.0:
+            raise ValueError("huber_beta deve ser positivo.")
+        if min(
+            probe_loss_weight,
+            download_loss_weight,
+            rank_loss_weight,
+            probe_diff_loss_weight,
+        ) < 0.0:
+            raise ValueError("Pesos da loss não podem ser negativos.")
+
+        self.rank_loss_weight = rank_loss_weight
+        self.probe_diff_loss_weight = probe_diff_loss_weight
+        self.huber_beta = huber_beta
+        self.rank_logit_scale_kbps = rank_logit_scale_kbps
+        self.rank_margin_threshold_kbps = rank_margin_threshold_kbps
+        self.register_buffer(
+            "target_mean",
+            torch.tensor(normalizer.target_mean, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "target_std",
+            torch.tensor(normalizer.target_std, dtype=torch.float32),
+        )
+        self.register_buffer(
+            "target_weights",
+            torch.tensor(
+                [
+                    probe_loss_weight,
+                    probe_loss_weight,
+                    download_loss_weight,
+                ],
+                dtype=torch.float32,
+            ),
+        )
+
+    def _denormalize(self, values: torch.Tensor) -> torch.Tensor:
+        return values * self.target_std + self.target_mean
+
+    def forward(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        """Calcula regressão robusta e ranking A/B."""
+        regression = F.smooth_l1_loss(
+            prediction,
+            target,
+            beta=self.huber_beta,
+            reduction="none",
+        )
+        regression_loss = (regression * self.target_weights).mean()
+
+        predicted_raw = self._denormalize(prediction)
+        target_raw = self._denormalize(target)
+        predicted_probe_diff = predicted_raw[:, 0] - predicted_raw[:, 1]
+        target_probe_diff = target_raw[:, 0] - target_raw[:, 1]
+
+        confident_mask = (
+            target_probe_diff.abs() >= self.rank_margin_threshold_kbps
+        )
+        if confident_mask.any():
+            rank_target = (target_probe_diff[confident_mask] >= 0.0).float()
+            rank_logits = (
+                predicted_probe_diff[confident_mask]
+                / self.rank_logit_scale_kbps
+            )
+            rank_loss = F.binary_cross_entropy_with_logits(
+                rank_logits,
+                rank_target,
+            )
+        else:
+            rank_loss = prediction.sum() * 0.0
+
+        diff_loss = F.smooth_l1_loss(
+            predicted_probe_diff / self.rank_logit_scale_kbps,
+            target_probe_diff / self.rank_logit_scale_kbps,
+            beta=1.0,
+        )
+
+        return (
+            regression_loss
+            + self.rank_loss_weight * rank_loss
+            + self.probe_diff_loss_weight * diff_loss
+        )
 
 
 def parse_args() -> TrainConfig:
@@ -102,21 +228,35 @@ def parse_args() -> TrainConfig:
     parser.add_argument(
         "--sequence-length",
         type=int,
-        default=10,
+        default=RNN_SEQUENCE_LENGTH,
         help="Tamanho da janela temporal da RNN.",
+    )
+
+    parser.add_argument(
+        "--probe-target-window",
+        type=int,
+        default=3,
+        help="Janela de mediana dos probes usados como alvo A/B.",
     )
 
     parser.add_argument(
         "--feature-size",
         type=int,
-        default=16,
+        default=RNN_FEATURE_SIZE,
         help="Quantidade de features por timestep.",
+    )
+
+    parser.add_argument(
+        "--output-size",
+        type=int,
+        default=RNN_TARGET_SIZE,
+        help="Quantidade de saídas previstas pela RNN.",
     )
 
     parser.add_argument(
         "--hidden-size",
         type=int,
-        default=64,
+        default=RNN_HIDDEN_SIZE,
         help="Tamanho do estado oculto da GRU.",
     )
 
@@ -144,15 +284,78 @@ def parse_args() -> TrainConfig:
     parser.add_argument(
         "--weight-decay",
         type=float,
-        default=1e-4,
+        default=3e-4,
         help="Regularização L2/weight decay aplicada pelo AdamW.",
     )
 
     parser.add_argument(
         "--dropout",
         type=float,
-        default=0.10,
+        default=0.20,
         help="Dropout aplicado ao estado oculto antes da camada final.",
+    )
+
+    parser.add_argument(
+        "--l1-lambda",
+        type=float,
+        default=0.0,
+        help="Regularização L1 opcional aplicada aos pesos.",
+    )
+
+    parser.add_argument(
+        "--grad-clip",
+        type=float,
+        default=1.0,
+        help="Norma máxima do gradiente. Use 0 para desativar.",
+    )
+
+    parser.add_argument(
+        "--huber-beta",
+        type=float,
+        default=1.0,
+        help="Beta da SmoothL1/Huber loss em escala normalizada.",
+    )
+
+    parser.add_argument(
+        "--probe-loss-weight",
+        type=float,
+        default=1.25,
+        help="Peso da regressão dos probes A/B.",
+    )
+
+    parser.add_argument(
+        "--download-loss-weight",
+        type=float,
+        default=0.75,
+        help="Peso da regressão da vazão real de download.",
+    )
+
+    parser.add_argument(
+        "--rank-loss-weight",
+        type=float,
+        default=0.75,
+        help="Peso da loss de classificação do melhor probe A/B.",
+    )
+
+    parser.add_argument(
+        "--probe-diff-loss-weight",
+        type=float,
+        default=0.30,
+        help="Peso da loss da diferença probeA - probeB.",
+    )
+
+    parser.add_argument(
+        "--rank-logit-scale-kbps",
+        type=float,
+        default=80.0,
+        help="Escala em kbps usada no logit do ranking A/B.",
+    )
+
+    parser.add_argument(
+        "--rank-margin-threshold-kbps",
+        type=float,
+        default=30.0,
+        help="Margem mínima entre probes para cobrar a loss de ranking A/B.",
     )
 
     parser.add_argument(
@@ -177,7 +380,9 @@ def parse_args() -> TrainConfig:
         server_a_id=args.server_a,
         server_b_id=args.server_b,
         sequence_length=args.sequence_length,
+        probe_target_smoothing_window=args.probe_target_window,
         feature_size=args.feature_size,
+        output_size=args.output_size,
         hidden_size=args.hidden_size,
         batch_size=args.batch_size,
         epochs=args.epochs,
@@ -186,6 +391,15 @@ def parse_args() -> TrainConfig:
         device=args.device,
         weight_decay=args.weight_decay,
         dropout=args.dropout,
+        l1_lambda=args.l1_lambda,
+        grad_clip_norm=args.grad_clip,
+        huber_beta=args.huber_beta,
+        probe_loss_weight=args.probe_loss_weight,
+        download_loss_weight=args.download_loss_weight,
+        rank_loss_weight=args.rank_loss_weight,
+        probe_diff_loss_weight=args.probe_diff_loss_weight,
+        rank_logit_scale_kbps=args.rank_logit_scale_kbps,
+        rank_margin_threshold_kbps=args.rank_margin_threshold_kbps,
     )
 
 
@@ -242,12 +456,19 @@ def create_dataloaders(
         sequence_length=config.sequence_length,
         server_a_id=config.server_a_id,
         server_b_id=config.server_b_id,
+        probe_target_smoothing_window=config.probe_target_smoothing_window,
     )
     sample_feature_size = len(samples[0].x[0])
     if sample_feature_size != config.feature_size:
         raise ValueError(
             "Feature size configurado incompatível com o dataset: "
             f"config={config.feature_size}, dataset={sample_feature_size}."
+        )
+    sample_output_size = len(samples[0].y)
+    if sample_output_size != config.output_size:
+        raise ValueError(
+            "Output size configurado incompatível com o dataset: "
+            f"config={config.output_size}, dataset={sample_output_size}."
         )
 
     train_samples, val_samples = split_samples(
@@ -290,6 +511,8 @@ def train_one_epoch(
     loss_fn: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    l1_lambda: float,
+    grad_clip_norm: float,
 ) -> EpochMetrics:
     """
     Executa uma época de treinamento.
@@ -319,7 +542,15 @@ def train_one_epoch(
         prediction: torch.Tensor = model(x_batch)
         loss: torch.Tensor = loss_fn(prediction, y_batch)
 
+        if l1_lambda > 0.0:
+            l1_penalty = torch.zeros((), device=device)
+            for parameter in model.parameters():
+                l1_penalty = l1_penalty + parameter.abs().sum()
+            loss = loss + l1_lambda * l1_penalty
+
         loss.backward()
+        if grad_clip_norm > 0.0:
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
         optimizer.step()
 
         total_loss += float(loss.item())
@@ -389,10 +620,29 @@ def save_checkpoint(
         "model_state_dict": model.state_dict(),
         "normalizer_mean": normalizer.mean,
         "normalizer_std": normalizer.std,
+        "target_mean": normalizer.target_mean,
+        "target_std": normalizer.target_std,
+        "target_clip_min": normalizer.target_clip_min,
+        "target_clip_max": normalizer.target_clip_max,
         "sequence_length": config.sequence_length,
+        "probe_target_smoothing_window": config.probe_target_smoothing_window,
         "feature_size": config.feature_size,
+        "output_size": config.output_size,
         "hidden_size": config.hidden_size,
         "dropout": config.dropout,
+        "loss_config": {
+            "type": "smooth_l1_plus_rank",
+            "huber_beta": config.huber_beta,
+            "probe_loss_weight": config.probe_loss_weight,
+            "download_loss_weight": config.download_loss_weight,
+            "rank_loss_weight": config.rank_loss_weight,
+            "probe_diff_loss_weight": config.probe_diff_loss_weight,
+            "rank_logit_scale_kbps": config.rank_logit_scale_kbps,
+            "rank_margin_threshold_kbps": config.rank_margin_threshold_kbps,
+            "weight_decay": config.weight_decay,
+            "l1_lambda": config.l1_lambda,
+            "grad_clip_norm": config.grad_clip_norm,
+        },
         "server_a_id": config.server_a_id,
         "server_b_id": config.server_b_id,
     }
@@ -419,11 +669,20 @@ def main() -> None:
     model = StreamingRNN(
         input_size=config.feature_size,
         hidden_size=config.hidden_size,
-        output_size=2,
+        output_size=config.output_size,
         dropout=config.dropout,
     ).to(device)
 
-    loss_fn: nn.Module = nn.MSELoss()
+    loss_fn: nn.Module = RnnPredictionLoss(
+        normalizer=normalizer,
+        probe_loss_weight=config.probe_loss_weight,
+        download_loss_weight=config.download_loss_weight,
+        rank_loss_weight=config.rank_loss_weight,
+        probe_diff_loss_weight=config.probe_diff_loss_weight,
+        huber_beta=config.huber_beta,
+        rank_logit_scale_kbps=config.rank_logit_scale_kbps,
+        rank_margin_threshold_kbps=config.rank_margin_threshold_kbps,
+    ).to(device)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -440,6 +699,8 @@ def main() -> None:
             loss_fn=loss_fn,
             optimizer=optimizer,
             device=device,
+            l1_lambda=config.l1_lambda,
+            grad_clip_norm=config.grad_clip_norm,
         )
 
         val_metrics: EpochMetrics = evaluate(

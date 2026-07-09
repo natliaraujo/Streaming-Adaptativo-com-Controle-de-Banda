@@ -3,11 +3,12 @@ Constrói datasets supervisionados para treinamento da RNN.
 
 Este módulo lê arquivos CSV de métricas dos experimentos e transforma as linhas
 em sequências temporais. Cada amostra contém uma janela de estados recentes como
-entrada e a vazão futura observada dos servidores A e B como alvo.
+entrada e três alvos: os probes futuros dos servidores A/B e a vazão real
+futura do download.
 
 A RNN é treinada para prever:
 
-    [throughput_A_kbps, throughput_B_kbps]
+    [probe_A_kbps, probe_B_kbps, download_throughput_kbps]
 
 a partir de uma sequência de features contendo métricas dos servidores, estado
 do buffer e informações do último download.
@@ -32,15 +33,23 @@ class RnnSample:
 @dataclass(frozen=True)
 class FeatureNormalizer:
     """
-    Normaliza features usando média e desvio padrão.
+    Normaliza features e alvos usando média e desvio padrão.
 
     Attributes:
         mean: Média de cada feature.
         std: Desvio padrão de cada feature. Valores zero são substituídos por 1.
+        target_mean: Média de cada alvo previsto.
+        target_std: Desvio padrão de cada alvo previsto.
+        target_clip_min: Menor valor observado por alvo.
+        target_clip_max: Percentil alto usado como teto de previsão por alvo.
     """
 
     mean: list[float]
     std: list[float]
+    target_mean: list[float] | None = None
+    target_std: list[float] | None = None
+    target_clip_min: list[float] | None = None
+    target_clip_max: list[float] | None = None
 
     def normalize_sequence(self, sequence: list[list[float]]) -> list[list[float]]:
         """
@@ -68,16 +77,59 @@ class FeatureNormalizer:
         """
         Normaliza o alvo de vazão.
 
-        Esta implementação não normaliza o alvo. O modelo aprende diretamente
-        valores em kbps. Para o tamanho deste projeto, isso é suficiente.
+        Quando estatísticas de alvo estão disponíveis, cada saída é colocada na
+        sua própria escala normalizada. Isso evita que a vazão real do download
+        domine a perda por estar em escala diferente dos probes.
 
         Args:
-            target: Lista `[throughput_A, throughput_B]`.
+            target: Lista `[probe_A, probe_B, download_throughput]`.
 
         Returns:
-            O próprio alvo sem normalização.
+            Alvo normalizado, ou o próprio alvo quando não há estatísticas.
         """
-        return target
+        if self.target_mean is None or self.target_std is None:
+            return target
+
+        return [
+            (value - self.target_mean[index]) / self.target_std[index]
+            for index, value in enumerate(target)
+        ]
+
+    def denormalize_target(
+        self,
+        target: list[float],
+        clamp: bool = True,
+    ) -> list[float]:
+        """
+        Retorna previsões normalizadas para a escala original em kbps.
+
+        Args:
+            target: Lista de saídas previstas pelo modelo.
+            clamp: Quando verdadeiro, limita previsões ao intervalo observado
+                no treino para reduzir picos fora da distribuição.
+
+        Returns:
+            Lista na escala original, ou a própria lista se não houver
+            estatísticas de alvo no checkpoint.
+        """
+        if self.target_mean is None or self.target_std is None:
+            return target
+
+        denormalized = [
+            value * self.target_std[index] + self.target_mean[index]
+            for index, value in enumerate(target)
+        ]
+
+        if not clamp or self.target_clip_min is None or self.target_clip_max is None:
+            return denormalized
+
+        return [
+            min(
+                max(value, self.target_clip_min[index]),
+                self.target_clip_max[index],
+            )
+            for index, value in enumerate(denormalized)
+        ]
 
 
 class StreamingRnnDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
@@ -87,8 +139,8 @@ class StreamingRnnDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
     Cada item retornado possui:
 
         x: Tensor com shape `(sequence_length, feature_size)`.
-        y: Tensor com shape `(2,)`, representando a vazão futura dos servidores
-           A e B.
+        y: Tensor com shape `(3,)`, representando os probes futuros dos
+           servidores A/B e a vazão real do próximo download.
     """
 
     def __init__(
@@ -347,17 +399,66 @@ def row_to_target(row: dict[str, str]) -> list[float]:
     """
     Converte uma linha do CSV no alvo supervisionado.
 
-    O alvo é a vazão observada dos dois servidores no instante futuro.
+    O alvo combina os probes futuros dos dois servidores, usados para ranquear
+    A/B, e a vazão real futura do segmento baixado, usada para escolher
+    qualidade.
 
     Args:
         row: Linha do CSV.
 
     Returns:
-        Lista `[throughput_A, throughput_B]`.
+        Lista `[probe_A, probe_B, download_throughput]`.
     """
     return [
         get_float(row, "probe_a_throughput_kbps"),
         get_float(row, "probe_b_throughput_kbps"),
+        get_float(row, "throughput_kbps"),
+    ]
+
+
+def median(values: list[float]) -> float:
+    """Calcula a mediana de uma lista não vazia."""
+    if not values:
+        raise ValueError("Não é possível calcular mediana sem valores.")
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def rows_to_target(
+    rows: list[dict[str, str]],
+    target_index: int,
+    probe_target_smoothing_window: int,
+) -> list[float]:
+    """
+    Converte linhas futuras no alvo supervisionado.
+
+    Os probes A/B usam mediana em uma janela curta para reduzir rótulos de
+    ranking causados por ruído instantâneo. A vazão de download permanece a do
+    próximo segmento, pois é a escala usada na decisão imediata de qualidade.
+    """
+    if probe_target_smoothing_window < 1:
+        raise ValueError("probe_target_smoothing_window deve ser positivo.")
+
+    end_index = min(
+        len(rows),
+        target_index + probe_target_smoothing_window,
+    )
+    probe_rows = rows[target_index:end_index]
+    target_row = rows[target_index]
+
+    return [
+        median([
+            get_float(row, "probe_a_throughput_kbps")
+            for row in probe_rows
+        ]),
+        median([
+            get_float(row, "probe_b_throughput_kbps")
+            for row in probe_rows
+        ]),
+        get_float(target_row, "throughput_kbps"),
     ]
 
 
@@ -406,6 +507,7 @@ def build_samples_from_rows(
     sequence_length: int,
     server_a_id: str,
     server_b_id: str,
+    probe_target_smoothing_window: int = 1,
 ) -> list[RnnSample]:
     """
     Cria amostras supervisionadas a partir das linhas do CSV.
@@ -418,6 +520,8 @@ def build_samples_from_rows(
         sequence_length: Tamanho da janela temporal de entrada.
         server_a_id: Identificador do servidor A.
         server_b_id: Identificador do servidor B.
+        probe_target_smoothing_window: Janela de mediana dos probes usados como
+            alvo de ranking.
 
     Returns:
         Lista de amostras `RnnSample`.
@@ -448,14 +552,16 @@ def build_samples_from_rows(
             for row in run_rows
         ]
 
-        targets: list[list[float]] = [row_to_target(row) for row in run_rows]
-
         for target_index in range(sequence_length, len(run_rows)):
             start_index: int = target_index - sequence_length
             end_index: int = target_index
 
             x_sequence: list[list[float]] = feature_rows[start_index:end_index]
-            y_target: list[float] = targets[target_index]
+            y_target: list[float] = rows_to_target(
+                rows=run_rows,
+                target_index=target_index,
+                probe_target_smoothing_window=probe_target_smoothing_window,
+            )
 
             samples.append(
                 RnnSample(
@@ -483,41 +589,99 @@ def compute_feature_normalizer(samples: list[RnnSample]) -> FeatureNormalizer:
     if not samples:
         raise ValueError("Não é possível normalizar dataset sem amostras.")
 
-    feature_size: int = len(samples[0].x[0])
-
     flattened: list[list[float]] = []
 
     for sample in samples:
         flattened.extend(sample.x)
 
-    mean: list[float] = []
-    std: list[float] = []
-
-    for feature_index in range(feature_size):
-        values: list[float] = [
-            vector[feature_index]
-            for vector in flattened
-        ]
-
-        feature_mean: float = sum(values) / len(values)
-
-        variance: float = sum(
-            (value - feature_mean) ** 2
-            for value in values
-        ) / len(values)
-
-        feature_std: float = variance ** 0.5
-
-        if feature_std == 0.0:
-            feature_std = 1.0
-
-        mean.append(feature_mean)
-        std.append(feature_std)
+    mean, std = compute_column_mean_std(flattened)
+    target_mean, target_std = compute_column_mean_std(
+        [sample.y for sample in samples]
+    )
+    target_clip_min, target_clip_max = compute_target_clipping_bounds(
+        [sample.y for sample in samples]
+    )
 
     return FeatureNormalizer(
         mean=mean,
         std=std,
+        target_mean=target_mean,
+        target_std=target_std,
+        target_clip_min=target_clip_min,
+        target_clip_max=target_clip_max,
     )
+
+
+def compute_column_mean_std(
+    values_by_row: list[list[float]],
+) -> tuple[list[float], list[float]]:
+    """
+    Calcula média e desvio padrão por coluna.
+
+    Args:
+        values_by_row: Matriz não vazia no formato `(linhas, colunas)`.
+
+    Returns:
+        Tupla com listas de médias e desvios. Desvios zero são substituídos por
+        1 para evitar divisão por zero na normalização.
+    """
+    if not values_by_row:
+        raise ValueError("Não é possível calcular estatísticas sem valores.")
+
+    column_count: int = len(values_by_row[0])
+    mean: list[float] = []
+    std: list[float] = []
+
+    for column_index in range(column_count):
+        values: list[float] = [
+            row[column_index]
+            for row in values_by_row
+        ]
+
+        column_mean: float = sum(values) / len(values)
+
+        variance: float = sum(
+            (value - column_mean) ** 2
+            for value in values
+        ) / len(values)
+
+        column_std: float = variance ** 0.5
+
+        if column_std == 0.0:
+            column_std = 1.0
+
+        mean.append(column_mean)
+        std.append(column_std)
+
+    return mean, std
+
+
+def compute_target_clipping_bounds(
+    targets: list[list[float]],
+    upper_quantile: float = 0.99,
+) -> tuple[list[float], list[float]]:
+    """
+    Calcula limites de previsão por alvo.
+
+    O limite inferior usa o mínimo observado para preservar casos de falha. O
+    limite superior usa um percentil alto para evitar picos artificiais fora da
+    distribuição de treino.
+    """
+    if not targets:
+        raise ValueError("Não é possível calcular clipping sem alvos.")
+    if not 0.0 < upper_quantile <= 1.0:
+        raise ValueError("upper_quantile deve estar no intervalo (0, 1].")
+
+    target_size = len(targets[0])
+    lower: list[float] = []
+    upper: list[float] = []
+    for target_index in range(target_size):
+        values = sorted(row[target_index] for row in targets)
+        lower.append(values[0])
+        quantile_index = int((len(values) - 1) * upper_quantile)
+        upper.append(values[quantile_index])
+
+    return lower, upper
 
 
 def load_rnn_samples_from_csv(
@@ -525,6 +689,7 @@ def load_rnn_samples_from_csv(
     sequence_length: int,
     server_a_id: str,
     server_b_id: str,
+    probe_target_smoothing_window: int = 1,
 ) -> list[RnnSample]:
     """
     Carrega amostras supervisionadas a partir de um CSV.
@@ -534,6 +699,7 @@ def load_rnn_samples_from_csv(
         sequence_length: Tamanho da janela temporal da RNN.
         server_a_id: Identificador do servidor A.
         server_b_id: Identificador do servidor B.
+        probe_target_smoothing_window: Janela de mediana para probes-alvo.
 
     Returns:
         Lista de amostras supervisionadas.
@@ -543,6 +709,7 @@ def load_rnn_samples_from_csv(
     required_columns: set[str] = {
         "server_id",
         "bitrate_kbps",
+        "throughput_kbps",
         "download_time_s",
         "buffer_level_s",
         "rebuffer_event",
@@ -566,6 +733,7 @@ def load_rnn_samples_from_csv(
         sequence_length=sequence_length,
         server_a_id=server_a_id,
         server_b_id=server_b_id,
+        probe_target_smoothing_window=probe_target_smoothing_window,
     )
 
 

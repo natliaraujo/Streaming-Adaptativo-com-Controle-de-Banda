@@ -38,6 +38,7 @@ class CsvMetricsWriter:
         "rnn_predicted_a_throughput_kbps",
         "rnn_predicted_b_throughput_kbps",
         "rnn_predicted_selected_throughput_kbps",
+        "rnn_predicted_download_throughput_kbps",
         "probe_a_ok",
         "probe_a_latency_ms",
         "probe_a_throughput_kbps",
@@ -170,6 +171,9 @@ class CsvMetricsWriter:
             ),
             "rnn_predicted_selected_throughput_kbps": self._format_optional_float(
                 metrics.rnn_predicted_selected_throughput_kbps
+            ),
+            "rnn_predicted_download_throughput_kbps": self._format_optional_float(
+                metrics.rnn_predicted_download_throughput_kbps
             ),
             "probe_a_ok": self._format_optional_int(metrics.probe_a_ok),
             "probe_a_latency_ms": self._format_optional_float(

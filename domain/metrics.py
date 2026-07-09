@@ -36,6 +36,7 @@ class SegmentMetrics:
     rnn_predicted_a_throughput_kbps: float | None = None
     rnn_predicted_b_throughput_kbps: float | None = None
     rnn_predicted_selected_throughput_kbps: float | None = None
+    rnn_predicted_download_throughput_kbps: float | None = None
 
     probe_a_ok: int | None = None
     probe_a_latency_ms: float | None = None
