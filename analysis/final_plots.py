@@ -38,9 +38,12 @@ class RnnDecisionMetric:
     buffer_level_s: float
     rebuffer_event: int
     failover_event: int
+    probe_a_throughput_kbps: float | None
+    probe_b_throughput_kbps: float | None
     predicted_a_throughput_kbps: float | None
     predicted_b_throughput_kbps: float | None
     predicted_selected_throughput_kbps: float | None
+    predicted_download_throughput_kbps: float | None
 
 
 POLICY_COLORS: tuple[str, ...] = ("#2563eb", "#d97706", "#059669")
@@ -49,6 +52,11 @@ RNN_PREDICTION_COLUMNS: set[str] = {
     "rnn_predicted_b_throughput_kbps",
     "rnn_predicted_selected_throughput_kbps",
 }
+RNN_PROBE_COLUMNS: set[str] = {
+    "probe_a_throughput_kbps",
+    "probe_b_throughput_kbps",
+}
+RNN_DECISION_COLUMNS: set[str] = RNN_PREDICTION_COLUMNS | RNN_PROBE_COLUMNS
 
 
 def _pyplot() -> Any:
@@ -164,7 +172,7 @@ def read_rnn_decision_metrics(csv_path: Path) -> list[RnnDecisionMetric]:
             "buffer_level_s",
             "rebuffer_event",
             "failover_event",
-            *RNN_PREDICTION_COLUMNS,
+            *RNN_DECISION_COLUMNS,
         }
         missing = required - fieldnames
         if missing:
@@ -184,6 +192,14 @@ def read_rnn_decision_metrics(csv_path: Path) -> list[RnnDecisionMetric]:
                 buffer_level_s=_float_value(row, "buffer_level_s"),
                 rebuffer_event=int(_float_value(row, "rebuffer_event")),
                 failover_event=int(_float_value(row, "failover_event")),
+                probe_a_throughput_kbps=_optional_float_value(
+                    row,
+                    "probe_a_throughput_kbps",
+                ),
+                probe_b_throughput_kbps=_optional_float_value(
+                    row,
+                    "probe_b_throughput_kbps",
+                ),
                 predicted_a_throughput_kbps=_optional_float_value(
                     row,
                     "rnn_predicted_a_throughput_kbps",
@@ -196,6 +212,10 @@ def read_rnn_decision_metrics(csv_path: Path) -> list[RnnDecisionMetric]:
                     row,
                     "rnn_predicted_selected_throughput_kbps",
                 ),
+                predicted_download_throughput_kbps=_optional_float_value(
+                    row,
+                    "rnn_predicted_download_throughput_kbps",
+                ),
             )
             for row in reader
         ]
@@ -207,6 +227,22 @@ def read_rnn_decision_metrics(csv_path: Path) -> list[RnnDecisionMetric]:
             f"CSV {csv_path} possui colunas da RNN, mas nenhuma previsão preenchida."
         )
     return metrics
+
+
+def _predicted_server_probe_throughput(
+    metric: RnnDecisionMetric,
+) -> float | None:
+    """Retorna o probe observado do servidor escolhido pela previsão da RNN."""
+    if (
+        metric.predicted_a_throughput_kbps is None
+        or metric.predicted_b_throughput_kbps is None
+    ):
+        return None
+
+    if metric.predicted_a_throughput_kbps >= metric.predicted_b_throughput_kbps:
+        return metric.probe_a_throughput_kbps
+
+    return metric.probe_b_throughput_kbps
 
 
 def _event_segments(metrics: list[PlotMetric], attribute: str) -> list[int]:
@@ -467,15 +503,87 @@ def plot_jitter(metrics: list[PlotMetric], output_path: Path, title: str) -> Non
     _save(fig, output_path, bottom_margin=0.12 if labels else 0.02)
 
 
-def generate_rnn_decision_plot(csv_path: Path, output_path: Path) -> None:
-    """Gera uma figura focada nas escolhas feitas pela Política 3/RNN."""
+def _rnn_decision_output_paths(output_path: Path) -> dict[str, Path]:
+    """Converte o caminho antigo em nomes separados para cada painel da RNN."""
+    stem = output_path.stem
+    suffix = output_path.suffix
+    return {
+        "throughput_quality": output_path,
+        "probe_a": output_path.with_name(f"{stem}_probe_a{suffix}"),
+        "probe_b": output_path.with_name(f"{stem}_probe_b{suffix}"),
+        "prediction_error": output_path.with_name(
+            f"{stem}_prediction_error{suffix}"
+        ),
+        "server_buffer": output_path.with_name(f"{stem}_server_buffer{suffix}"),
+    }
+
+
+def _error_summary_text(
+    predicted: list[float | None],
+    actual: list[float | None],
+) -> str | None:
+    """Calcula MAE e bias para séries com lacunas."""
+    errors = [
+        predicted_value - actual_value
+        for predicted_value, actual_value in zip(predicted, actual, strict=True)
+        if predicted_value is not None and actual_value is not None
+    ]
+    if not errors:
+        return None
+
+    mae = sum(abs(error) for error in errors) / len(errors)
+    bias = sum(errors) / len(errors)
+    return f"MAE={mae:.1f} kbps | bias={bias:.1f} kbps"
+
+
+def _annotate_error_summary(
+    axis: Any,
+    predicted: list[float | None],
+    actual: list[float | None],
+) -> None:
+    """Mostra resumo de erro no canto superior direito do eixo."""
+    summary = _error_summary_text(predicted, actual)
+    if summary is None:
+        return
+
+    axis.text(
+        0.995,
+        0.96,
+        summary,
+        transform=axis.transAxes,
+        ha="right",
+        va="top",
+        color="#374151",
+        fontsize=9,
+    )
+
+
+def _draw_rnn_failovers(axis: Any, metrics: list[RnnDecisionMetric]) -> None:
+    """Marca eventos de failover em gráficos da Política 3."""
+    for index, metric in enumerate(metrics):
+        if not metric.failover_event:
+            continue
+        axis.axvline(
+            metric.segment,
+            color="#dc2626",
+            linestyle="--",
+            linewidth=1.2,
+            alpha=0.55,
+            label="Failover" if index == 0 else None,
+        )
+
+
+def generate_rnn_decision_plot(csv_path: Path, output_path: Path) -> list[Path]:
+    """Gera figuras individuais focadas nas escolhas feitas pela Política 3/RNN."""
     metrics = read_rnn_decision_metrics(csv_path)
+    output_paths = _rnn_decision_output_paths(output_path)
+    generated: list[Path] = []
     plt = _pyplot()
-    fig, axes = plt.subplots(3, 1, figsize=(13, 12), sharex=True)
     segments = [metric.segment for metric in metrics]
 
-    prediction_axis = axes[0]
-    prediction_axis.plot(
+    fig, throughput_axis = plt.subplots(figsize=(12, 6))
+    bitrate_axis = throughput_axis.twinx()
+    throughput_axis.plot(
         segments,
         [metric.throughput_kbps for metric in metrics],
         color="#2563eb",
@@ -483,73 +591,173 @@ def generate_rnn_decision_plot(csv_path: Path, output_path: Path) -> None:
         marker="o",
         markersize=3,
         markevery=_markevery(len(segments)),
-        label="Vazão real",
+        label="Vazão real do download",
     )
-    prediction_axis.step(
+    predicted_download = [
+        metric.predicted_download_throughput_kbps
+        for metric in metrics
+    ]
+    if any(value is not None for value in predicted_download):
+        throughput_axis.plot(
+            segments,
+            predicted_download,
+            color="#7c3aed",
+            linestyle="--",
+            linewidth=2,
+            label="Vazão real prevista",
+        )
+        _annotate_error_summary(
+            throughput_axis,
+            predicted_download,
+            [metric.throughput_kbps for metric in metrics],
+        )
+    bitrate_axis.step(
         segments,
         [metric.bitrate_kbps for metric in metrics],
         where="mid",
         color="#d97706",
-        linewidth=2.0,
-        label="Bitrate",
+        linewidth=2,
+        label="Representação escolhida",
     )
-    prediction_axis.plot(
-        segments,
-        [metric.predicted_a_throughput_kbps for metric in metrics],
-        color="#0f766e",
-        linestyle="--",
-        linewidth=1.8,
-        label="Prev. A",
+    _set_quality_ticks(bitrate_axis, metrics)
+    _draw_rnn_failovers(throughput_axis, metrics)
+    throughput_axis.set_title("Política 3: vazão real, previsão e representação")
+    throughput_axis.set_xlabel("Número do segmento")
+    throughput_axis.set_ylabel("Vazão real do download (kbps)")
+    bitrate_axis.set_ylabel("Representação")
+    throughput_axis.grid(True, linestyle="--", alpha=0.28)
+    lines1, labels1 = throughput_axis.get_legend_handles_labels()
+    lines2, labels2 = bitrate_axis.get_legend_handles_labels()
+    handles, labels = _dedup_legend(lines1 + lines2, labels1 + labels2)
+    fig.legend(
+        handles,
+        labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.01),
+        ncol=min(3, len(labels)),
+        frameon=False,
     )
-    prediction_axis.plot(
-        segments,
-        [metric.predicted_b_throughput_kbps for metric in metrics],
-        color="#7c3aed",
-        linestyle="--",
-        linewidth=1.8,
-        label="Prev. B",
-    )
-    prediction_axis.plot(
-        segments,
-        [metric.predicted_selected_throughput_kbps for metric in metrics],
-        color="#111827",
-        linewidth=2.2,
-        alpha=0.86,
-        label="Prev. usada",
-    )
-    prediction_axis.set_title("Política 3: previsões da RNN e escolha de qualidade")
-    prediction_axis.set_ylabel("Vazão / bitrate (kbps)")
-    prediction_axis.grid(True, linestyle="--", alpha=0.28)
+    _save(fig, output_paths["throughput_quality"], bottom_margin=0.14)
+    generated.append(output_paths["throughput_quality"])
 
-    error_points = [
-        metric
+    for key, server_label, color, actual, predicted in (
+        (
+            "probe_a",
+            "A",
+            "#0f766e",
+            [metric.probe_a_throughput_kbps for metric in metrics],
+            [metric.predicted_a_throughput_kbps for metric in metrics],
+        ),
+        (
+            "probe_b",
+            "B",
+            "#7c3aed",
+            [metric.probe_b_throughput_kbps for metric in metrics],
+            [metric.predicted_b_throughput_kbps for metric in metrics],
+        ),
+    ):
+        fig, axis = plt.subplots(figsize=(12, 5.5))
+        axis.plot(
+            segments,
+            actual,
+            color=color,
+            linewidth=1.8,
+            marker="o",
+            markersize=3,
+            markevery=_markevery(len(segments)),
+            alpha=0.62,
+            label=f"Probe {server_label} real",
+        )
+        axis.plot(
+            segments,
+            predicted,
+            color=color,
+            linestyle="--",
+            linewidth=2,
+            label=f"Probe {server_label} previsto",
+        )
+        _draw_rnn_failovers(axis, metrics)
+        _annotate_error_summary(axis, predicted, actual)
+        axis.set_title(f"Política 3: probe {server_label} real vs previsão")
+        axis.set_xlabel("Número do segmento")
+        axis.set_ylabel("Vazão do probe (kbps)")
+        axis.set_ylim(bottom=0)
+        axis.grid(True, linestyle="--", alpha=0.28)
+        handles, labels = axis.get_legend_handles_labels()
+        handles, labels = _dedup_legend(handles, labels)
+        fig.legend(
+            handles,
+            labels,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.01),
+            ncol=min(3, len(labels)),
+            frameon=False,
+        )
+        _save(fig, output_paths[key], bottom_margin=0.13)
+        generated.append(output_paths[key])
+
+    selected_probe_targets = [
+        _predicted_server_probe_throughput(metric)
         for metric in metrics
+    ]
+    error_points = [
+        (metric, target)
+        for metric, target in zip(metrics, selected_probe_targets, strict=True)
         if metric.predicted_selected_throughput_kbps is not None
+        and target is not None
     ]
     errors = [
-        metric.predicted_selected_throughput_kbps - metric.throughput_kbps
-        for metric in error_points
+        metric.predicted_selected_throughput_kbps - target
+        for metric, target in error_points
         if metric.predicted_selected_throughput_kbps is not None
     ]
     error_colors = [
         "#dc2626" if error >= 0 else "#059669"
         for error in errors
     ]
-    axes[1].bar(
-        [metric.segment for metric in error_points],
+    fig, axis = plt.subplots(figsize=(12, 5.5))
+    axis.bar(
+        [metric.segment for metric, _target in error_points],
         errors,
         color=error_colors,
         alpha=0.78,
         width=0.82,
     )
-    axes[1].axhline(0, color="#111827", linewidth=1.1)
-    axes[1].set_title("Erro da previsão usada: positivo = superestimação")
-    axes[1].set_ylabel("Erro (kbps)")
-    axes[1].grid(True, axis="y", linestyle="--", alpha=0.28)
+    axis.axhline(0, color="#111827", linewidth=1.1)
+    if errors:
+        axis.text(
+            0.995,
+            0.96,
+            f"MAE={sum(abs(error) for error in errors) / len(errors):.1f} kbps | "
+            f"bias={sum(errors) / len(errors):.1f} kbps",
+            transform=axis.transAxes,
+            ha="right",
+            va="top",
+            color="#374151",
+            fontsize=9,
+        )
+    _draw_rnn_failovers(axis, metrics)
+    axis.set_title("Política 3: erro da previsão usada contra o probe alvo")
+    axis.set_xlabel("Número do segmento")
+    axis.set_ylabel("Erro (kbps)")
+    axis.grid(True, axis="y", linestyle="--", alpha=0.28)
+    handles, labels = axis.get_legend_handles_labels()
+    handles, labels = _dedup_legend(handles, labels)
+    if labels:
+        fig.legend(
+            handles,
+            labels,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.01),
+            ncol=len(labels),
+            frameon=False,
+        )
+    _save(fig, output_paths["prediction_error"], bottom_margin=0.10 if labels else 0.02)
+    generated.append(output_paths["prediction_error"])
 
     server_ids = list(dict.fromkeys(metric.server_id for metric in metrics))
     server_index = {server_id: index for index, server_id in enumerate(server_ids)}
-    server_axis = axes[2]
+    fig, server_axis = plt.subplots(figsize=(12, 5.8))
     buffer_axis = server_axis.twinx()
     server_axis.step(
         segments,
@@ -562,7 +770,7 @@ def generate_rnn_decision_plot(csv_path: Path, output_path: Path) -> None:
     server_axis.set_yticks(range(len(server_ids)), server_ids)
     server_axis.set_ylabel("Servidor")
     server_axis.set_xlabel("Número do segmento")
-    server_axis.set_title("Servidor escolhido, buffer e eventos")
+    server_axis.set_title("Política 3: servidor escolhido, buffer e eventos")
     server_axis.grid(True, linestyle="--", alpha=0.28)
 
     buffer_axis.plot(
@@ -585,22 +793,12 @@ def generate_rnn_decision_plot(csv_path: Path, output_path: Path) -> None:
             label="Rebuffering",
             zorder=4,
         )
-    for metric in metrics:
-        if metric.failover_event:
-            for axis in axes:
-                axis.axvline(
-                    metric.segment,
-                    color="#dc2626",
-                    linestyle="--",
-                    linewidth=1.2,
-                    alpha=0.55,
-                )
+    _draw_rnn_failovers(server_axis, metrics)
     buffer_axis.set_ylabel("Buffer (s)")
     buffer_axis.set_ylim(bottom=0)
-
-    handles: list[Any] = []
-    labels: list[str] = []
-    for axis in (prediction_axis, server_axis, buffer_axis):
+    handles = []
+    labels = []
+    for axis in (server_axis, buffer_axis):
         axis_handles, axis_labels = axis.get_legend_handles_labels()
         handles.extend(axis_handles)
         labels.extend(axis_labels)
@@ -610,10 +808,13 @@ def generate_rnn_decision_plot(csv_path: Path, output_path: Path) -> None:
         labels,
         loc="lower center",
         bbox_to_anchor=(0.5, 0.01),
-        ncol=min(5, len(labels)),
+        ncol=min(4, len(labels)),
         frameon=False,
     )
-    _save(fig, output_path, bottom_margin=0.13)
+    _save(fig, output_paths["server_buffer"], bottom_margin=0.13)
+    generated.append(output_paths["server_buffer"])
+
+    return generated
 
 
 def _plot_comparison(
@@ -776,12 +977,11 @@ def generate_final_plots(
     policy3_candidates = [
         csv_path
         for slug, _label, csv_path in policy_csvs
-        if slug == "policy3" and _csv_has_columns(csv_path, RNN_PREDICTION_COLUMNS)
+        if slug == "policy3" and _csv_has_columns(csv_path, RNN_DECISION_COLUMNS)
     ]
     if policy3_candidates:
         output_path = output_dir / "policy3_rnn_decisions.png"
-        generate_rnn_decision_plot(policy3_candidates[0], output_path)
-        generated.append(output_path)
+        generated.extend(generate_rnn_decision_plot(policy3_candidates[0], output_path))
     return generated
 
 

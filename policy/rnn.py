@@ -2,8 +2,9 @@
 Implementa a política 3 baseada em RNN.
 
 A política usa uma sequência temporal de observações dos servidores e do estado
-do player para prever a vazão futura dos servidores A e B. Depois escolhe o
-servidor com maior vazão prevista e seleciona uma qualidade segura para o buffer.
+do player para prever os probes futuros dos servidores A e B e a vazão real
+esperada do próximo download. Os probes ranqueiam o servidor; a vazão real
+prevista seleciona a qualidade segura para o buffer.
 """
 
 import torch
@@ -25,7 +26,7 @@ from policy.streaming_policy import StreamingPolicy
 
 
 class RnnStreamingPolicy(StreamingPolicy):
-    """Política de streaming que usa RNN para prever vazão futura."""
+    """Política de streaming que usa RNN para prever probes e vazão real."""
 
     def __init__(
         self,
@@ -34,6 +35,8 @@ class RnnStreamingPolicy(StreamingPolicy):
         feature_history: FeatureHistory,
         normalizer: FeatureNormalizer,
         safety_factor: float = 0.8,
+        server_selection_margin_kbps: float = 30.0,
+        observed_probe_weight: float = 0.70,
     ) -> None:
         """
         Inicializa a política RNN.
@@ -44,11 +47,22 @@ class RnnStreamingPolicy(StreamingPolicy):
             feature_history: Janela temporal de features.
             normalizer: Normalizador salvo no treinamento.
             safety_factor: Fator de segurança para seleção de qualidade.
+            server_selection_margin_kbps: Margem mínima para trocar de servidor
+                quando os scores A/B estão quase empatados.
+            observed_probe_weight: Peso do probe atual no score híbrido de
+                ranking. O restante vem da previsão da RNN.
         """
+        if server_selection_margin_kbps < 0.0:
+            raise ValueError("server_selection_margin_kbps não pode ser negativo.")
+        if not 0.0 <= observed_probe_weight <= 1.0:
+            raise ValueError("observed_probe_weight deve estar entre 0 e 1.")
+
         self.model: StreamingRNN = model
         self.feature_config: FeatureConfig = feature_config
         self.feature_history: FeatureHistory = feature_history
         self.normalizer: FeatureNormalizer = normalizer
+        self.server_selection_margin_kbps = server_selection_margin_kbps
+        self.observed_probe_weight = observed_probe_weight
         self.quality_selector = BufferAwareQualitySelector(
             safety_factor=safety_factor,
         )
@@ -143,22 +157,54 @@ class RnnStreamingPolicy(StreamingPolicy):
         with torch.no_grad():
             prediction: torch.Tensor = self.model(x)
 
-        predicted_a: float = max(0.0, float(prediction[0, 0].item()))
-        predicted_b: float = max(0.0, float(prediction[0, 1].item()))
+        predicted_values: list[float] = self.normalizer.denormalize_target(
+            [
+                float(prediction[0, index].item())
+                for index in range(prediction.shape[1])
+            ]
+        )
+        predicted_a_probe: float = max(0.0, predicted_values[0])
+        predicted_b_probe: float = max(0.0, predicted_values[1])
+        predicted_download_throughput: float = max(
+            0.0,
+            predicted_values[2],
+        )
 
         server_a: ServerInfo = manifest.servers[0]
         server_b: ServerInfo = manifest.servers[1]
 
-        if predicted_a >= predicted_b:
-            server: ServerInfo = server_a
-            predicted_throughput_kbps: float = predicted_a
-        else:
-            server = server_b
-            predicted_throughput_kbps = predicted_b
+        observed_a_probe = self._observed_probe_throughput(
+            observations,
+            server_a.id,
+        )
+        observed_b_probe = self._observed_probe_throughput(
+            observations,
+            server_b.id,
+        )
+        score_a = self._server_ranking_score(
+            predicted_probe=predicted_a_probe,
+            observed_probe=observed_a_probe,
+        )
+        score_b = self._server_ranking_score(
+            predicted_probe=predicted_b_probe,
+            observed_probe=observed_b_probe,
+        )
+        server = self._select_server_from_scores(
+            manifest=manifest,
+            server_a=server_a,
+            score_a=score_a,
+            server_b=server_b,
+            score_b=score_b,
+        )
+        predicted_selected_probe_throughput = (
+            predicted_a_probe
+            if server.id == server_a.id
+            else predicted_b_probe
+        )
 
         representation: Representation = self.quality_selector.select(
             representations=manifest.representations,
-            predicted_throughput_kbps=predicted_throughput_kbps,
+            predicted_throughput_kbps=predicted_download_throughput,
             buffer_level_s=buffer.level_s,
             segment_duration_s=manifest.segment_duration_s,
         )
@@ -166,10 +212,55 @@ class RnnStreamingPolicy(StreamingPolicy):
         return StreamingAction(
             server=server,
             representation=representation,
-            predicted_server_a_throughput_kbps=predicted_a,
-            predicted_server_b_throughput_kbps=predicted_b,
-            predicted_selected_throughput_kbps=predicted_throughput_kbps,
+            predicted_server_a_throughput_kbps=predicted_a_probe,
+            predicted_server_b_throughput_kbps=predicted_b_probe,
+            predicted_selected_throughput_kbps=predicted_selected_probe_throughput,
+            predicted_download_throughput_kbps=predicted_download_throughput,
         )
+
+    def _observed_probe_throughput(
+        self,
+        observations: dict[str, ServerObservation],
+        server_id: str,
+    ) -> float | None:
+        """Retorna o probe atual de um servidor quando ele é confiável."""
+        observation = observations.get(server_id)
+        if observation is None or not observation.success:
+            return None
+        if observation.throughput_kbps is None or observation.throughput_kbps <= 0.0:
+            return None
+        return observation.throughput_kbps
+
+    def _server_ranking_score(
+        self,
+        predicted_probe: float,
+        observed_probe: float | None,
+    ) -> float:
+        """Combina previsão da RNN e probe medido para ranquear servidores."""
+        if observed_probe is None:
+            return predicted_probe
+        return (
+            self.observed_probe_weight * observed_probe
+            + (1.0 - self.observed_probe_weight) * predicted_probe
+        )
+
+    def _select_server_from_scores(
+        self,
+        manifest: Manifest,
+        server_a: ServerInfo,
+        score_a: float,
+        server_b: ServerInfo,
+        score_b: float,
+    ) -> ServerInfo:
+        """Escolhe servidor usando margem para evitar trocas por ruído."""
+        margin = self.server_selection_margin_kbps
+        if score_a >= score_b + margin:
+            return server_a
+        if score_b >= score_a + margin:
+            return server_b
+        if 0 <= self.last_server_index < len(manifest.servers):
+            return manifest.servers[self.last_server_index]
+        return sorted(manifest.servers, key=lambda item: item.priority)[0]
 
     def _fallback_action(
         self,

@@ -539,6 +539,9 @@ class ExperimentRunner:
             rnn_predicted_selected_throughput_kbps=(
                 action.predicted_selected_throughput_kbps
             ),
+            rnn_predicted_download_throughput_kbps=(
+                action.predicted_download_throughput_kbps
+            ),
             probe_a_ok=None if obs_a is None else int(obs_a.success),
             probe_a_latency_ms=None if obs_a is None else obs_a.latency_ms,
             probe_a_throughput_kbps=None if obs_a is None else obs_a.throughput_kbps,

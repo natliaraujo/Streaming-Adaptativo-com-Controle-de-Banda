@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from config import RNN_TARGET_SIZE  # noqa: E402
 from models.checkpoint import load_rnn_checkpoint  # noqa: E402
 from models.dataset import (  # noqa: E402
     RnnSample,
@@ -28,8 +29,10 @@ class PredictionRow:
     index: int
     predicted_a: float
     predicted_b: float
+    predicted_download: float
     target_a: float
     target_b: float
+    target_download: float
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,6 +68,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="CSV opcional com previsão, alvo e erro por amostra.",
+    )
+    parser.add_argument(
+        "--ranking-margin-kbps",
+        type=float,
+        default=30.0,
+        help="Margem mínima entre probes para medir ranking confiante.",
     )
     return parser.parse_args()
 
@@ -103,14 +112,22 @@ def predict_samples(
                 [normalized_sequence],
                 dtype=torch.float32,
             )
-            prediction = model(x)[0]
+            raw_prediction = model(x)[0]
+            prediction = normalizer.denormalize_target(
+                [
+                    float(raw_prediction[prediction_index].item())
+                    for prediction_index in range(raw_prediction.shape[0])
+                ]
+            )
             rows.append(
                 PredictionRow(
                     index=index,
-                    predicted_a=float(prediction[0].item()),
-                    predicted_b=float(prediction[1].item()),
+                    predicted_a=prediction[0],
+                    predicted_b=prediction[1],
+                    predicted_download=prediction[2],
                     target_a=float(sample.y[0]),
                     target_b=float(sample.y[1]),
+                    target_download=float(sample.y[2]),
                 )
             )
 
@@ -134,12 +151,19 @@ def mape(predicted: list[float], target: list[float]) -> float:
     return mean(percentages)
 
 
-def print_metrics(rows: list[PredictionRow], split: str, train_ratio: float) -> None:
+def print_metrics(
+    rows: list[PredictionRow],
+    split: str,
+    train_ratio: float,
+    ranking_margin_kbps: float,
+) -> None:
     """Imprime métricas agregadas de previsão."""
     predicted_a = [row.predicted_a for row in rows]
     predicted_b = [row.predicted_b for row in rows]
+    predicted_download = [row.predicted_download for row in rows]
     target_a = [row.target_a for row in rows]
     target_b = [row.target_b for row in rows]
+    target_download = [row.target_download for row in rows]
     errors_a = [
         row.predicted_a - row.target_a
         for row in rows
@@ -148,11 +172,26 @@ def print_metrics(rows: list[PredictionRow], split: str, train_ratio: float) -> 
         row.predicted_b - row.target_b
         for row in rows
     ]
+    errors_download = [
+        row.predicted_download - row.target_download
+        for row in rows
+    ]
     errors_all = errors_a + errors_b
 
     correct_best_server = sum(
         1
         for row in rows
+        if (row.predicted_a >= row.predicted_b)
+        == (row.target_a >= row.target_b)
+    )
+    confident_rows = [
+        row
+        for row in rows
+        if abs(row.target_a - row.target_b) >= ranking_margin_kbps
+    ]
+    correct_confident_best_server = sum(
+        1
+        for row in confident_rows
         if (row.predicted_a >= row.predicted_b)
         == (row.target_a >= row.target_b)
     )
@@ -176,7 +215,14 @@ def print_metrics(rows: list[PredictionRow], split: str, train_ratio: float) -> 
         f"MAPE={mape(predicted_b, target_b):.2f}%"
     )
     print(
-        "  Geral:      "
+        "  Download:   "
+        f"MAE={mean([abs(error) for error in errors_download]):.2f} kbps | "
+        f"RMSE={rmse(errors_download):.2f} kbps | "
+        f"bias={mean(errors_download):.2f} kbps | "
+        f"MAPE={mape(predicted_download, target_download):.2f}%"
+    )
+    print(
+        "  Probes:     "
         f"MAE={mean([abs(error) for error in errors_all]):.2f} kbps | "
         f"RMSE={rmse(errors_all):.2f} kbps | "
         f"bias={mean(errors_all):.2f} kbps"
@@ -186,6 +232,12 @@ def print_metrics(rows: list[PredictionRow], split: str, train_ratio: float) -> 
         "Acurácia na escolha do melhor servidor: "
         f"{correct_best_server / max(len(rows), 1) * 100.0:.2f}% "
         f"({correct_best_server}/{len(rows)})"
+    )
+    print(
+        "Acurácia com margem confiável "
+        f"(>= {ranking_margin_kbps:g} kbps): "
+        f"{correct_confident_best_server / max(len(confident_rows), 1) * 100.0:.2f}% "
+        f"({correct_confident_best_server}/{len(confident_rows)})"
     )
     print("Bias positivo indica superestimação; bias negativo indica subestimação.")
 
@@ -204,6 +256,9 @@ def write_predictions(rows: list[PredictionRow], output_path: Path) -> None:
                 "predicted_b_kbps",
                 "target_b_kbps",
                 "error_b_kbps",
+                "predicted_download_kbps",
+                "target_download_kbps",
+                "error_download_kbps",
                 "predicted_best_server",
                 "actual_best_server",
             ]
@@ -220,6 +275,9 @@ def write_predictions(rows: list[PredictionRow], output_path: Path) -> None:
                     round(row.predicted_b, 3),
                     round(row.target_b, 3),
                     round(row.predicted_b - row.target_b, 3),
+                    round(row.predicted_download, 3),
+                    round(row.target_download, 3),
+                    round(row.predicted_download - row.target_download, 3),
                     predicted_best,
                     actual_best,
                 ]
@@ -229,11 +287,18 @@ def write_predictions(rows: list[PredictionRow], output_path: Path) -> None:
 def main() -> None:
     args = parse_args()
     loaded_model = load_rnn_checkpoint(args.model)
+    if loaded_model.output_size != RNN_TARGET_SIZE:
+        raise ValueError(
+            "Checkpoint incompatível com as saídas atuais da RNN: "
+            f"modelo tem {loaded_model.output_size}, esperado {RNN_TARGET_SIZE}. "
+            "Treine novamente com `python -m models.train`."
+        )
     samples = load_rnn_samples_from_csv(
         csv_path=args.csv,
         sequence_length=loaded_model.sequence_length,
         server_a_id=loaded_model.server_a_id,
         server_b_id=loaded_model.server_b_id,
+        probe_target_smoothing_window=loaded_model.probe_target_smoothing_window,
     )
     sample_feature_size = len(samples[0].x[0])
     if loaded_model.feature_size != sample_feature_size:
@@ -255,7 +320,7 @@ def main() -> None:
 
     print(f"Modelo: {args.model}")
     print(f"CSV: {args.csv}")
-    print_metrics(rows, args.split, args.train_ratio)
+    print_metrics(rows, args.split, args.train_ratio, args.ranking_margin_kbps)
 
     if args.predictions_output is not None:
         write_predictions(rows, args.predictions_output)

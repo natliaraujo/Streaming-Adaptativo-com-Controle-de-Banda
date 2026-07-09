@@ -21,6 +21,9 @@ from config import (  # noqa: E402
     MANIFEST_URL,
     NUM_SEGMENTS,
     RNN_FEATURE_SIZE,
+    RNN_OBSERVED_PROBE_RANKING_WEIGHT,
+    RNN_SERVER_SELECTION_MARGIN_KBPS,
+    RNN_TARGET_SIZE,
     SAFETY_FACTOR,
 )
 from experiment import CsvMetricsWriter, ExperimentRunner  # noqa: E402
@@ -50,6 +53,13 @@ def main() -> None:
             "Checkpoint incompatível com as features atuais: "
             f"modelo tem {loaded_model.feature_size}, esperado {RNN_FEATURE_SIZE}. "
             "Colete dados e treine novamente a RNN."
+        )
+    if loaded_model.output_size != RNN_TARGET_SIZE:
+        raise ValueError(
+            "Checkpoint incompatível com as saídas atuais da RNN: "
+            f"modelo tem {loaded_model.output_size}, esperado {RNN_TARGET_SIZE}. "
+            "Treine novamente com `python -m models.train` para gerar as "
+            "previsões de probe A, probe B e vazão real de download."
         )
 
     output_dir: Path = PROJECT_ROOT / "outputs"
@@ -99,6 +109,8 @@ def main() -> None:
         feature_history=feature_history,
         normalizer=loaded_model.normalizer,
         safety_factor=SAFETY_FACTOR,
+        server_selection_margin_kbps=RNN_SERVER_SELECTION_MARGIN_KBPS,
+        observed_probe_weight=RNN_OBSERVED_PROBE_RANKING_WEIGHT,
     )
 
     csv_writer = CsvMetricsWriter(str(csv_path))

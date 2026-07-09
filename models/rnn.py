@@ -2,8 +2,8 @@
 Define o modelo de rede neural recorrente usado pela política 3.
 
 O modelo recebe uma sequência temporal de features representando o histórico
-recente dos servidores e do player. A saída prevista corresponde à vazão futura
-esperada para cada servidor disponível.
+recente dos servidores e do player. A saída prevista corresponde aos probes
+futuros dos servidores A/B e à vazão real esperada do próximo download.
 
 A arquitetura recomendada usa GRU por ser simples, eficiente e suficiente para
 séries temporais curtas no contexto do experimento.
@@ -19,7 +19,7 @@ class StreamingRNN(nn.Module):
         input_size: int,
         hidden_size: int = 64,
         num_layers: int = 1,
-        output_size: int = 2,
+        output_size: int = 3,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()

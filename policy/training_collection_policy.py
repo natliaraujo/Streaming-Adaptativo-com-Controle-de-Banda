@@ -13,7 +13,7 @@ continua explorando com probabilidade controlada.
 from random import Random
 
 from domain.action import StreamingAction
-from domain.manifest import Manifest, Representation, ServerInfo
+from domain.manifest import Manifest, Representation, ServerInfo, normalize_server_id
 from monitoring.observation_store import ServerObservation
 from player.buffer import BufferManager
 from policy.streaming_policy import StreamingPolicy
@@ -32,6 +32,10 @@ class TrainingDataCollectionPolicy(StreamingPolicy):
         self,
         seed: int | None = None,
         low_buffer_explore_probability: float = 0.30,
+        preferred_server_id: str | None = None,
+        preferred_server_probability: float = 0.0,
+        high_quality_probability: float = 0.0,
+        top_quality_count: int = 2,
     ) -> None:
         """
         Inicializa a política de coleta.
@@ -41,13 +45,36 @@ class TrainingDataCollectionPolicy(StreamingPolicy):
             low_buffer_explore_probability: Probabilidade de continuar a
                 exploração quando o buffer está abaixo do mínimo, mas ainda
                 acima do nível crítico.
+            preferred_server_id: Servidor priorizado na coleta enviesada.
+            preferred_server_probability: Probabilidade de usar o servidor
+                preferido quando ele está saudável.
+            high_quality_probability: Probabilidade de amostrar uma das maiores
+                representações quando o buffer permite exploração.
+            top_quality_count: Quantidade de maiores representações consideradas
+                na amostragem enviesada de qualidade.
         """
         if not 0.0 <= low_buffer_explore_probability <= 1.0:
             raise ValueError(
                 "low_buffer_explore_probability deve estar entre 0 e 1."
             )
+        if not 0.0 <= preferred_server_probability <= 1.0:
+            raise ValueError(
+                "preferred_server_probability deve estar entre 0 e 1."
+            )
+        if not 0.0 <= high_quality_probability <= 1.0:
+            raise ValueError("high_quality_probability deve estar entre 0 e 1.")
+        if top_quality_count < 1:
+            raise ValueError("top_quality_count deve ser positivo.")
         self.random = Random(seed)
         self.low_buffer_explore_probability = low_buffer_explore_probability
+        self.preferred_server_id = (
+            None
+            if preferred_server_id is None
+            else normalize_server_id(preferred_server_id)
+        )
+        self.preferred_server_probability = preferred_server_probability
+        self.high_quality_probability = high_quality_probability
+        self.top_quality_count = top_quality_count
         self._server_cycle: list[str] = []
         self._action_cycle: list[tuple[str, int]] = []
 
@@ -114,8 +141,18 @@ class TrainingDataCollectionPolicy(StreamingPolicy):
             buffer.level_s < recovery_threshold_s
             and self.random.random() >= self.low_buffer_explore_probability
         ):
-            server = self._choose_server_from_cycle(healthy_servers)
+            server = self._choose_biased_server(healthy_servers)
             return server, manifest.representations[0]
+
+        if (
+            self.high_quality_probability > 0.0
+            and self.random.random() < self.high_quality_probability
+        ):
+            server = self._choose_biased_server(healthy_servers)
+            representation = self._choose_high_quality_representation(
+                manifest.representations
+            )
+            return server, representation
 
         healthy_by_id = {server.id: server for server in healthy_servers}
         valid_pairs: set[tuple[str, int]] = {
@@ -181,4 +218,36 @@ class TrainingDataCollectionPolicy(StreamingPolicy):
 
         selected_id = self._server_cycle.pop(0)
         return healthy_by_id[selected_id]
+
+    def _choose_biased_server(
+        self,
+        healthy_servers: list[ServerInfo],
+    ) -> ServerInfo:
+        """Escolhe servidor com viés opcional para reproduzir regimes on-policy."""
+        healthy_by_display_id = {
+            normalize_server_id(server.id): server
+            for server in healthy_servers
+        }
+        if (
+            self.preferred_server_id is not None
+            and self.preferred_server_id in healthy_by_display_id
+            and self.random.random() < self.preferred_server_probability
+        ):
+            return healthy_by_display_id[self.preferred_server_id]
+
+        return self._choose_server_from_cycle(healthy_servers)
+
+    def _choose_high_quality_representation(
+        self,
+        representations: list[Representation],
+    ) -> Representation:
+        """Amostra uma das maiores representações disponíveis."""
+        ranked = sorted(
+            enumerate(representations),
+            key=lambda item: item[1].bitrate_kbps,
+            reverse=True,
+        )
+        candidates = ranked[: min(self.top_quality_count, len(ranked))]
+        _index, representation = self.random.choice(candidates)
+        return representation
 

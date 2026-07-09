@@ -24,7 +24,9 @@ class LoadedRnnModel:
     model: StreamingRNN
     normalizer: FeatureNormalizer
     sequence_length: int
+    probe_target_smoothing_window: int
     feature_size: int
+    output_size: int
     hidden_size: int
     dropout: float
     server_a_id: str
@@ -68,13 +70,14 @@ def load_rnn_checkpoint(checkpoint_path: Path) -> LoadedRnnModel:
         ) from exc
 
     feature_size: int = int(checkpoint["feature_size"])
+    output_size: int = int(checkpoint.get("output_size", 2))
     hidden_size: int = int(checkpoint["hidden_size"])
     dropout: float = float(checkpoint.get("dropout", 0.0))
 
     model = StreamingRNN(
         input_size=feature_size,
         hidden_size=hidden_size,
-        output_size=2,
+        output_size=output_size,
         dropout=dropout,
     )
 
@@ -84,13 +87,37 @@ def load_rnn_checkpoint(checkpoint_path: Path) -> LoadedRnnModel:
     normalizer = FeatureNormalizer(
         mean=list(checkpoint["normalizer_mean"]),
         std=list(checkpoint["normalizer_std"]),
+        target_mean=(
+            None
+            if checkpoint.get("target_mean") is None
+            else list(checkpoint["target_mean"])
+        ),
+        target_std=(
+            None
+            if checkpoint.get("target_std") is None
+            else list(checkpoint["target_std"])
+        ),
+        target_clip_min=(
+            None
+            if checkpoint.get("target_clip_min") is None
+            else list(checkpoint["target_clip_min"])
+        ),
+        target_clip_max=(
+            None
+            if checkpoint.get("target_clip_max") is None
+            else list(checkpoint["target_clip_max"])
+        ),
     )
 
     return LoadedRnnModel(
         model=model,
         normalizer=normalizer,
         sequence_length=int(checkpoint["sequence_length"]),
+        probe_target_smoothing_window=int(
+            checkpoint.get("probe_target_smoothing_window", 1)
+        ),
         feature_size=feature_size,
+        output_size=output_size,
         hidden_size=hidden_size,
         dropout=dropout,
         server_a_id=normalize_server_id(str(checkpoint["server_a_id"])),

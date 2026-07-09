@@ -29,3 +29,4 @@ class StreamingAction:
     predicted_server_a_throughput_kbps: float | None = None
     predicted_server_b_throughput_kbps: float | None = None
     predicted_selected_throughput_kbps: float | None = None
+    predicted_download_throughput_kbps: float | None = None
